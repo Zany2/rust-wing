@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/images/logo.png" alt="RustWing logo" width="180" />
+  <img src="./docs/images/logo.png" alt="RustWing" width="120"/>
 </p>
 
 <h1 align="center">RustWing</h1>
