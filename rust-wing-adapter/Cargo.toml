@@ -1,0 +1,19 @@
+[package]
+name = "rust-wing-adapter"
+version.workspace = true
+edition.workspace = true
+description = "Adapter contracts and bridges for RustWing integrations"
+license.workspace = true
+
+[features]
+default = []
+redis = ["dep:redis"]
+
+[dependencies]
+async-trait = { workspace = true }
+redis = { workspace = true, optional = true }
+rust-wing-core = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

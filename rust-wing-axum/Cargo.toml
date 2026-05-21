@@ -1,0 +1,14 @@
+[package]
+name = "rust-wing-axum"
+version.workspace = true
+edition.workspace = true
+description = "Axum WebSocket integration for RustWing"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+rust-wing-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

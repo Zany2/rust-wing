@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rust_wing::{
+use rust_wing_core::{
     Cluster, ClusterBackendConfig, ClusterConfig, ClusterEnvelope, ConnectionPolicy, Identity,
     MemoryPresenceStore, NodeId, NodePublisher, OutboundFrame, PresenceStore, Result, Route,
     RustWing, RustWingConfig, RustWingError, UserId,
@@ -124,6 +124,40 @@ async fn multi_connection_policy_keeps_all_sessions() {
 }
 
 // Local sessions are preferred before cluster routing 集群路由前优先使用本地会话
+// Concurrent accepts keep registry indexes consistent 并发接入会保持注册表索引一致
+#[tokio::test]
+async fn concurrent_accepts_keep_registry_consistent() {
+    // Enable multi-connection behavior so every task owns a distinct session 启用多连接行为以保留每个任务的独立会话
+    let wing = RustWing::new(RustWingConfig {
+        connection_policy: ConnectionPolicy::Multi,
+        ..RustWingConfig::default()
+    });
+
+    // Accept many users concurrently to exercise the sharded registry 并发接入多个用户以验证分片注册表
+    let mut tasks = Vec::new();
+    for index in 0..64 {
+        let wing = wing.clone();
+        tasks.push(tokio::spawn(async move {
+            let user_id = format!("user-{index}");
+            wing.accept(Identity::new(user_id)).await.unwrap();
+        }));
+    }
+
+    // Wait for all accepts before reading registry snapshots 读取注册表快照前等待全部接入完成
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    // Confirm both primary and reverse indexes are populated 确认主索引和反向索引都已填充
+    assert_eq!(wing.connection_count().unwrap(), 64);
+    assert_eq!(
+        wing.list_user_sessions(&UserId::from("user-7"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn send_to_user_prefers_local_session() {
     // Build a manager with one local session 构建包含一个本地会话的管理器

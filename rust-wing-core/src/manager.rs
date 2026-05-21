@@ -1,5 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use crate::cluster::{Cluster, ClusterEnvelope, MemoryPresenceStore, NoopPublisher, Route};
 use crate::config::{ClusterBackendConfig, ConnectionPolicy, RustWingConfig};
@@ -22,16 +25,16 @@ struct Inner {
     // Optional cluster dependencies 可选集群依赖
     cluster: Option<Cluster>,
     // Local session registry 本地会话注册表
-    registry: RwLock<Registry>,
+    registry: Registry,
 }
 
 // Local indexes for active sessions 活跃会话的本地索引
 #[derive(Default)]
 struct Registry {
-    // Direct session lookup by id 按标识直接查找会话
-    by_session: HashMap<SessionId, Session>,
-    // Reverse index from user to sessions 用户到会话的反向索引
-    by_user: HashMap<UserId, HashSet<SessionId>>,
+    // Direct session lookup by id 按会话标识直接查找
+    by_session: DashMap<SessionId, Session>,
+    // Reverse index from user to session ids 用户到会话标识的反向索引
+    by_user: DashMap<UserId, HashSet<SessionId>>,
 }
 
 impl RustWing {
@@ -71,7 +74,7 @@ impl RustWing {
             inner: Arc::new(Inner {
                 config: config.normalized(),
                 cluster,
-                registry: RwLock::new(Registry::default()),
+                registry: Registry::default(),
             }),
         }
     }
@@ -91,7 +94,7 @@ impl RustWing {
         );
 
         // Insert the session and collect sessions replaced by policy 插入会话并收集被策略替换的会话
-        let replaced = self.insert_session(accepted.session.clone())?;
+        let replaced = self.insert_session(accepted.session.clone());
         // Close and unregister sessions displaced by single-connection mode 关闭并注销被单连接模式替换的会话
         for session in replaced {
             session.close("replaced by a newer connection");
@@ -106,15 +109,8 @@ impl RustWing {
 
     // Remove one session from local and cluster state 从本地与集群状态中移除一个会话
     pub async fn unregister(&self, session: &Session) -> Result<()> {
-        {
-            // Remove the session from the local registry 从本地注册表移除会话
-            let mut registry = self
-                .inner
-                .registry
-                .write()
-                .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-            registry.remove(session);
-        }
+        // Remove the session from the local registry 从本地注册表移除会话
+        self.inner.registry.remove(session);
 
         // Remove the distributed route when cluster presence is active 当集群在线状态启用时删除分布式路由
         if let Some(cluster) = &self.inner.cluster {
@@ -150,7 +146,7 @@ impl RustWing {
         session.mark_heartbeat(client_heartbeat_time);
         // Keep the distributed route alive alongside the heartbeat 随心跳一起延长分布式路由
         self.touch_presence(session).await?;
-        // Read one consistent view for acknowledgement fields 读取一个一致视图用于确认字段
+        // Read one consistent view for acknowledgement fields 读取一致快照用于确认字段
         let snapshot = session.snapshot();
         Ok(HeartbeatAckData {
             client_heartbeat_time: snapshot.client_heartbeat_time,
@@ -163,8 +159,8 @@ impl RustWing {
 
     // Remove sessions that exceeded the inactivity timeout 移除超过不活跃超时的会话
     pub async fn reap_inactive_sessions(&self) -> Result<usize> {
-        // Snapshot local sessions before awaiting unregister calls 在等待注销前先获取本地会话快照
-        let sessions = self.all_sessions()?;
+        // Snapshot local sessions before awaiting unregister calls 等待注销前先获取本地会话快照
+        let sessions = self.all_sessions();
         // Retain only sessions that crossed the configured inactivity threshold 仅保留超过配置阈值的会话
         let inactive = sessions
             .into_iter()
@@ -209,7 +205,7 @@ impl RustWing {
                 remote_nodes.insert(route.node_id);
             }
         }
-        // Forward the frame to every node that owns one of the user's sessions 将帧转发到拥有该用户会话的每个节点
+        // Forward the frame to every node that owns one of the user's sessions 转发到拥有该用户会话的每个节点
         for node_id in &remote_nodes {
             cluster
                 .publisher
@@ -225,7 +221,7 @@ impl RustWing {
     // Broadcast a frame to every local session 向所有本地会话广播一帧
     pub fn broadcast_local(&self, frame: OutboundFrame) -> Result<usize> {
         // Snapshot the current local sessions 获取当前本地会话快照
-        let sessions = self.all_sessions()?;
+        let sessions = self.all_sessions();
         // Count only successfully enqueued deliveries 仅统计成功入队的投递
         let mut sent = 0;
         for session in sessions {
@@ -239,7 +235,7 @@ impl RustWing {
     // Send a frame to every local session of one user 向某个用户的所有本地会话发送一帧
     pub fn send_local(&self, user_id: &UserId, frame: OutboundFrame) -> Result<usize> {
         // Snapshot the target user's local sessions 获取目标用户的本地会话快照
-        let sessions = self.sessions_for_user(user_id)?;
+        let sessions = self.sessions_for_user(user_id);
         // Count only successfully enqueued deliveries 仅统计成功入队的投递
         let mut sent = 0;
         for session in sessions {
@@ -252,19 +248,19 @@ impl RustWing {
 
     // Look up one session by id 按标识查找一个会话
     pub fn get_session(&self, session_id: &SessionId) -> Result<Option<Session>> {
-        // Acquire a shared registry view 获取注册表共享视图
-        let registry = self
+        // Read from the sharded session index 从分片会话索引读取
+        Ok(self
             .inner
             .registry
-            .read()
-            .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-        Ok(registry.by_session.get(session_id).cloned())
+            .by_session
+            .get(session_id)
+            .map(|session| session.value().clone()))
     }
 
     // List snapshots for one user's sessions 列出某个用户的会话快照
     pub fn list_user_sessions(&self, user_id: &UserId) -> Result<Vec<SessionSnapshot>> {
         Ok(self
-            .sessions_for_user(user_id)?
+            .sessions_for_user(user_id)
             .into_iter()
             .map(|session| session.snapshot())
             .collect())
@@ -272,13 +268,8 @@ impl RustWing {
 
     // Count active local sessions 统计活跃本地会话
     pub fn connection_count(&self) -> Result<usize> {
-        // Acquire a shared registry view 获取注册表共享视图
-        let registry = self
-            .inner
-            .registry
-            .read()
-            .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-        Ok(registry.by_session.len())
+        // Read the sharded session index length 读取分片会话索引长度
+        Ok(self.inner.registry.by_session.len())
     }
 
     // Deliver a received cluster envelope locally 在本地投递收到的集群信封
@@ -287,63 +278,27 @@ impl RustWing {
     }
 
     // Insert a session and return sessions displaced by policy 插入会话并返回被策略替换的会话
-    fn insert_session(&self, session: Session) -> Result<Vec<Session>> {
-        // Acquire exclusive registry access before mutation 修改前获取注册表独占访问
-        let mut registry = self
-            .inner
-            .registry
-            .write()
-            .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-
-        // Remove prior sessions when single-connection mode is active 单连接模式启用时移除旧会话
-        let mut replaced = Vec::new();
-        if self.inner.config.connection_policy == ConnectionPolicy::Single {
-            replaced = registry.remove_user(session.user_id());
-        }
-
-        // Update the reverse user index 更新用户反向索引
-        registry
-            .by_user
-            .entry(session.user_id().clone())
-            .or_default()
-            .insert(session.id().clone());
-        // Store the session in the primary index 将会话写入主索引
-        registry.by_session.insert(session.id().clone(), session);
-        Ok(replaced)
+    fn insert_session(&self, session: Session) -> Vec<Session> {
+        // Mutate only the target user's shard while keeping both indexes aligned 只修改目标用户分片并保持两个索引一致
+        self.inner.registry.insert(
+            session,
+            self.inner.config.connection_policy == ConnectionPolicy::Single,
+        )
     }
 
     // Snapshot all local sessions for one user 获取某个用户的全部本地会话快照
-    fn sessions_for_user(&self, user_id: &UserId) -> Result<Vec<Session>> {
-        // Acquire a shared registry view 获取注册表共享视图
-        let registry = self
-            .inner
-            .registry
-            .read()
-            .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-        Ok(registry
-            .by_user
-            .get(user_id)
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(|id| registry.by_session.get(id))
-            .cloned()
-            .collect())
+    fn sessions_for_user(&self, user_id: &UserId) -> Vec<Session> {
+        self.inner.registry.sessions_for_user(user_id)
     }
 
     // Snapshot every local session 获取所有本地会话快照
-    fn all_sessions(&self) -> Result<Vec<Session>> {
-        // Acquire a shared registry view 获取注册表共享视图
-        let registry = self
-            .inner
-            .registry
-            .read()
-            .map_err(|_| RustWingError::Cluster("registry lock poisoned".into()))?;
-        Ok(registry.by_session.values().cloned().collect())
+    fn all_sessions(&self) -> Vec<Session> {
+        self.inner.registry.all_sessions()
     }
 
     // Register a distributed route for one session 为一个会话注册分布式路由
     async fn register_presence(&self, session: &Session) -> Result<()> {
-        // Stop when no cluster integration exists 不存在集成集群时直接结束
+        // Stop when no cluster integration exists 不存在集群集成时直接结束
         let Some(cluster) = &self.inner.cluster else {
             return Ok(());
         };
@@ -368,7 +323,7 @@ impl RustWing {
 
     // Refresh the distributed route for one session 刷新一个会话的分布式路由
     async fn touch_presence(&self, session: &Session) -> Result<()> {
-        // Stop when no cluster integration exists 不存在集成集群时直接结束
+        // Stop when no cluster integration exists 不存在集群集成时直接结束
         let Some(cluster) = &self.inner.cluster else {
             return Ok(());
         };
@@ -390,28 +345,90 @@ impl RustWing {
 }
 
 impl Registry {
-    // Remove one exact session from both indexes 从两个索引中移除一个精确会话
-    fn remove(&mut self, session: &Session) {
-        // Remove the primary session record 删除主会话记录
-        self.by_session.remove(session.id());
-        // Remove the reverse index entry and prune empty sets 删除反向索引项并清理空集合
-        if let Some(ids) = self.by_user.get_mut(session.user_id()) {
-            ids.remove(session.id());
-            if ids.is_empty() {
-                self.by_user.remove(session.user_id());
+    // Insert a session and optionally replace existing user sessions 插入会话并按需替换用户旧会话
+    fn insert(&self, session: Session, replace_user: bool) -> Vec<Session> {
+        let user_id = session.user_id().clone();
+        let session_id = session.id().clone();
+
+        // Update one user's reverse index under the DashMap shard guard 在 DashMap 分片保护下更新单个用户反向索引
+        let replaced_ids = match self.by_user.entry(user_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                let ids = entry.get_mut();
+                let replaced_ids = if replace_user {
+                    let replaced_ids = ids.iter().cloned().collect::<Vec<_>>();
+                    ids.clear();
+                    replaced_ids
+                } else {
+                    Vec::new()
+                };
+                ids.insert(session_id.clone());
+                replaced_ids
             }
-        }
+            Entry::Vacant(entry) => {
+                let mut ids = HashSet::new();
+                ids.insert(session_id.clone());
+                entry.insert(ids);
+                Vec::new()
+            }
+        };
+
+        // Remove replaced sessions from the primary index after updating the user index 更新用户索引后移除被替换会话
+        let replaced = replaced_ids
+            .into_iter()
+            .filter_map(|id| self.by_session.remove(&id).map(|(_, session)| session))
+            .collect::<Vec<_>>();
+        // Store the new session in the primary index 将新会话写入主索引
+        self.by_session.insert(session_id, session);
+        replaced
     }
 
-    // Remove every session for one user 移除某个用户的全部会话
-    fn remove_user(&mut self, user_id: &UserId) -> Vec<Session> {
-        // Take ownership of the user's session ids 获取该用户会话标识的所有权
-        let Some(ids) = self.by_user.remove(user_id) else {
-            return Vec::new();
+    // Remove one exact session from both indexes 从两个索引中移除一个精确会话
+    fn remove(&self, session: &Session) {
+        let user_id = session.user_id().clone();
+        let session_id = session.id().clone();
+
+        // Remove the session id from the user's reverse index 从用户反向索引中移除会话标识
+        let should_prune_user = match self.by_user.entry(user_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                let ids = entry.get_mut();
+                ids.remove(&session_id);
+                ids.is_empty()
+            }
+            Entry::Vacant(_) => false,
         };
-        // Remove the primary entries and return the old sessions 删除主索引项并返回旧会话
-        ids.into_iter()
-            .filter_map(|id| self.by_session.remove(&id))
+        // Drop empty user buckets after the entry guard is gone 在 entry guard 释放后清理空用户桶
+        if should_prune_user {
+            self.by_user.remove(&user_id);
+        }
+
+        // Remove the primary session record 删除主会话记录
+        self.by_session.remove(&session_id);
+    }
+
+    // Snapshot all local sessions for one user 获取某个用户的全部本地会话快照
+    fn sessions_for_user(&self, user_id: &UserId) -> Vec<Session> {
+        // Copy session ids before looking up sessions 先复制会话标识再查询会话
+        let session_ids = self
+            .by_user
+            .get(user_id)
+            .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        session_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.by_session
+                    .get(&id)
+                    .map(|session| session.value().clone())
+            })
+            .collect()
+    }
+
+    // Snapshot every local session 获取所有本地会话快照
+    fn all_sessions(&self) -> Vec<Session> {
+        self.by_session
+            .iter()
+            .map(|entry| entry.value().clone())
             .collect()
     }
 }

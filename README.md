@@ -1,93 +1,67 @@
+<p align="center">
+  <img src="./docs/images/logo.png" alt="RustWing logo" width="180" />
+</p>
+
 <h1 align="center">RustWing</h1>
 
 <p align="center">
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white" />
-  <img alt="Tokio" src="https://img.shields.io/badge/Tokio-1-5E5CE6" />
-  <img alt="Serde" src="https://img.shields.io/badge/Serde-1-3B82F6" />
-  <img alt="Status" src="https://img.shields.io/badge/status-core%20foundation-orange" />
+  A modular WebSocket framework for Rust realtime applications.
 </p>
 
 <p align="center">
-  English · <a href="./README_zh.md">简体中文</a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white" />
+  <img alt="Status" src="https://img.shields.io/badge/status-early--stage-orange" />
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" />
 </p>
 
-> **A distributed WebSocket framework core for Rust.** RustWing provides reusable session management, bounded write queues, protocol envelopes, local delivery, presence routing, and cluster transport abstractions for horizontally scalable realtime services.
+<p align="center">
+  English | <a href="./README_zh.md">简体中文</a>
+</p>
 
-```bash
-cargo test
-```
+---
 
-## What It Is
+RustWing is a Rust framework for building realtime WebSocket services. It provides a clean foundation for connection lifecycle, session management, heartbeat handling, message delivery, and distributed routing.
 
-RustWing is not a business-specific IM utility package. It is a reusable WebSocket framework core that keeps the most important realtime service concerns small and composable.
+The project is split into focused crates, so applications can start small and add framework integrations or external backends only when needed.
 
-The project currently focuses on the core library. Web framework adapters and distributed backends are designed as pluggable layers instead of being hard-wired into the session manager.
+## Why RustWing
 
-## Core Features
-
-- **Session lifecycle**: accepts user identities, creates session IDs, stores snapshots, and unregisters sessions.
-- **Connection policy**: supports single-session and multi-session users.
-- **Bounded write queue**: each session owns a bounded outbound channel with explicit backpressure behavior.
-- **Heartbeat lifecycle**: records heartbeats, returns acknowledgement timing data, and reaps inactive sessions.
-- **Protocol envelope**: provides versioned message and frame types built on `serde`.
-- **Local delivery**: sends messages to local users and broadcasts to local sessions.
-- **Presence routing**: abstracts multi-session user route registration, touch, lookup, and removal.
-- **Cluster publishing**: abstracts node-to-node message publishing for Redis, NATS, or custom backends.
-- **Memory backend**: includes an in-memory presence store for tests and examples.
-
-## Architecture
-
-```text
-application
-  |
-web framework adapter
-  |  axum / hyper / tokio-tungstenite
-  |
-rust-wing core
-  |-- protocol: versioned message envelope and frame types
-  |-- session: connection identity, snapshots, write queue
-  |-- manager: local registry, connection policy, send/broadcast
-  |-- cluster: presence store and node publisher traits
-  |
-cluster backends
-  |-- redis
-  |-- nats
-  |-- memory/testing
-```
-
-## Delivery Model
-
-| Step | Responsibility | Description |
-| --- | --- | --- |
-| Accept | `RustWing::accept` | Register an authenticated identity and create a session. |
-| Write | web adapter | Own the outbound receiver and write frames to the socket. |
-| Send local | manager | Deliver frames to local sessions first. |
-| Route remote | presence store | Locate the node that owns the target user. |
-| Publish remote | node publisher | Forward the frame to the target node channel. |
-| Apply remote | manager | Handle the cluster envelope and deliver it locally. |
+- Build WebSocket services with a reusable core instead of repeating connection plumbing.
+- Keep business authentication and message handling inside your application.
+- Choose single-session or multi-session users according to your product model.
+- Scale from local development to distributed deployment with the same core API.
+- Use framework integrations without coupling the core to one web stack.
 
 ## Quick Start
 
-Add RustWing to your application crate:
+Add RustWing to your application:
 
 ```toml
 [dependencies]
-rust-wing = "0.1"
+rust-wing-core = "0.0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Use the core manager:
+Add the extra crate you need for the following examples:
+
+```toml
+rust-wing-axum = "0.0.1"
+rust-wing-adapter = { version = "0.0.1", features = ["redis"] }
+axum = { version = "0.8", features = ["ws"] }
+```
+
+Create a manager, accept a session, and send a message to a user:
 
 ```rust
-use rust_wing::{Identity, OutboundFrame, RustWing, RustWingConfig};
+use rust_wing_core::{Identity, OutboundFrame, RustWing, RustWingConfig};
 
 #[tokio::main]
-async fn main() -> rust_wing::Result<()> {
+async fn main() -> rust_wing_core::Result<()> {
     let wing = RustWing::new(RustWingConfig::default());
     let accepted = wing.accept(Identity::new("alice")).await?;
 
     wing.send_to_user("alice", OutboundFrame::text("hello")).await?;
 
-    // The web framework adapter owns this receiver and writes frames to the socket.
     let mut outbound = accepted.outbound;
     if let Some(frame) = outbound.recv().await {
         println!("send frame: {:?}", frame.kind);
@@ -97,69 +71,104 @@ async fn main() -> rust_wing::Result<()> {
 }
 ```
 
-## Configuration
+## Web Framework Usage
 
-| Option | Description |
-| --- | --- |
-| `node_id` | Current node identity used by cluster routing. |
-| `heartbeat_interval` | Suggested heartbeat interval for clients. |
-| `heartbeat_timeout` | Timeout threshold for inactive sessions. |
-| `write_queue_capacity` | Per-session outbound queue capacity. |
-| `connection_policy` | `Single` replaces old sessions; `Multi` keeps multiple sessions. |
-| `cluster.enabled` | Enables presence registration and remote publishing. |
-| `cluster.backend` | Selects `Memory` by default or `Redis { url }` explicitly. |
-| `cluster.route_ttl` | Presence route expiration duration. |
+In a web application, authenticate the request first, create an `Identity`, then pass the upgraded connection to RustWing:
 
-## Project Structure
+```rust
+use axum::{extract::ws::WebSocketUpgrade, response::Response};
+use rust_wing_axum::upgrade;
+use rust_wing_core::{Identity, RustWing};
 
-```text
-rust-wing/
-├─ src/
-│  ├─ cluster.rs      Presence store and node publisher abstractions
-│  ├─ config.rs       Framework configuration
-│  ├─ error.rs        Public error type
-│  ├─ identity.rs     Node, user, device, and session IDs
-│  ├─ manager.rs      Core RustWing manager
-│  ├─ protocol.rs     Message envelope and outbound frame types
-│  ├─ session.rs      Session state and write queue
-│  └─ lib.rs          Public crate exports
-├─ tests/             Core behavior tests
-├─ README.md
-└─ README_zh.md
+async fn websocket_handler(ws: WebSocketUpgrade, wing: RustWing) -> Response {
+    let identity = Identity::new("alice");
+    upgrade(ws, wing, identity)
+}
 ```
 
-## Development Commands
+Use `upgrade_with_handler` when your application needs to handle business messages received from the client.
+
+## Distributed Usage
+
+RustWing can run with an external routing backend when your service has multiple nodes:
+
+```rust
+use rust_wing_adapter::{
+    redis_cluster_from_config, RedisPresenceConfig, RedisPublisherConfig,
+};
+use rust_wing_core::{ClusterConfig, RustWing, RustWingConfig};
+
+#[tokio::main]
+async fn main() -> rust_wing_core::Result<()> {
+    let cluster = redis_cluster_from_config(
+        RedisPresenceConfig::new("redis://127.0.0.1:6379"),
+        RedisPublisherConfig::new("redis://127.0.0.1:6379"),
+    )
+    .await?;
+
+    let wing = RustWing::with_cluster(
+        RustWingConfig {
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(cluster),
+    );
+
+    Ok(())
+}
+```
+
+## Workspace
+
+| Crate | Purpose |
+| --- | --- |
+| `rust-wing-core` | Core APIs for sessions, protocol messages, routing, and connection management. |
+| `rust-wing-adapter` | Adapter contracts and backend implementations for external infrastructure. |
+| `rust-wing-axum` | WebSocket integration for Axum applications. |
+
+## Configuration
+
+Common configuration fields:
+
+| Field | Purpose |
+| --- | --- |
+| `node_id` | Identifies the current server node. |
+| `heartbeat_interval` | Suggested heartbeat interval for clients. |
+| `heartbeat_timeout` | Timeout for inactive sessions. |
+| `write_queue_capacity` | Outbound queue size for each session. |
+| `connection_policy` | Controls whether users can keep one or multiple sessions. |
+| `cluster.enabled` | Enables distributed routing. |
+| `cluster.route_ttl` | Expiration duration for distributed routes. |
+
+## Status
+
+RustWing is currently in an early foundation stage. The core APIs are usable, but package names, module boundaries, and adapter APIs may still change before the first stable release.
+
+## Development
 
 ```bash
-cargo fmt
-cargo check
+cargo fmt --all
+cargo check --workspace
 cargo test
 ```
 
 ## Roadmap
 
-- `axum` WebSocket adapter
-- Redis presence store
-- Redis Pub/Sub node publisher
-- NATS backend
-- room, channel, and topic broadcast
-- authentication middleware
-- metrics and tracing integration
-- examples and benchmarks
+- Stabilize the public APIs.
+- Add complete examples.
+- Expand framework integrations.
+- Improve distributed deployment documentation.
+- Add tracing, metrics, and operational hooks.
+- Add room, channel, and topic helpers.
 
-## Security Notes
+## License
 
-RustWing is a framework core. Authentication, authorization, rate limiting, TLS termination, and public network exposure should be handled by the application or adapter layer. Do not expose a WebSocket gateway to untrusted networks without a clear authentication and resource-limit strategy.
+Licensed under either of:
 
-## Git Notes
+- Apache License, Version 2.0
+- MIT license
 
-The following paths are local build output, IDE state, or personal assistant instructions and should not be committed:
-
-- `target/`
-- `.idea/`
-- `.vscode/`
-- `.env`
-- `AGENTS.md`
-- `CLAUDE.md`
-
-If these files are already tracked by Git, adding them to `.gitignore` will not untrack them automatically. Use `git rm --cached` before committing.
+See [LICENSE](./LICENSE).
