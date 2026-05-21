@@ -30,3 +30,14 @@ desktop.ini
 *.log
 *.tmp
 *.temp
+
+# Test coverage and profiling output
+/coverage/
+/tarpaulin-report.html
+/lcov.info
+*.profraw
+*.profdata
+
+# Local scratch output
+/tmp/
+/dist/

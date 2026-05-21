@@ -1,93 +1,67 @@
+<p align="center">
+  <img src="./docs/images/logo.png" alt="RustWing logo" width="180" />
+</p>
+
 <h1 align="center">RustWing</h1>
 
 <p align="center">
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white" />
-  <img alt="Tokio" src="https://img.shields.io/badge/Tokio-1-5E5CE6" />
-  <img alt="Serde" src="https://img.shields.io/badge/Serde-1-3B82F6" />
-  <img alt="Status" src="https://img.shields.io/badge/status-core%20foundation-orange" />
+  面向 Rust 实时应用的模块化 WebSocket 框架。
 </p>
 
 <p align="center">
-  <a href="./README.md">English</a> · 简体中文
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white" />
+  <img alt="Status" src="https://img.shields.io/badge/status-early--stage-orange" />
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" />
 </p>
 
-> **一个面向 Rust 的分布式 WebSocket 框架内核。** RustWing 为可水平扩展的实时服务提供可复用的会话管理、有界写队列、协议信封、本地投递、在线路由和集群传输抽象。
+<p align="center">
+  <a href="./README.md">English</a> | 简体中文
+</p>
 
-```bash
-cargo test
-```
+---
 
-## 项目定位
+RustWing 是一个用于构建实时 WebSocket 服务的 Rust 框架。它提供连接生命周期、会话管理、心跳处理、消息投递和分布式路由等基础能力。
 
-RustWing 不是某个业务项目里的 IM 工具包，而是一个可复用的 WebSocket 框架内核。它把实时服务中最关键的能力拆成小而清晰的模块。
+项目采用多个职责清晰的 crate 组成，应用可以从核心能力开始，在需要时再接入 Web 框架集成或外部后端。
 
-当前项目重点是核心库。Web 框架适配层和分布式后端会作为可插拔层接入，而不是和会话管理器强绑定。
+## 为什么选择 RustWing
 
-## 核心能力
-
-- **会话生命周期**：接收用户身份、创建会话 ID、保存快照、注销会话。
-- **连接策略**：支持单用户单连接和单用户多连接。
-- **有界写队列**：每个会话拥有独立的有界 outbound channel，并明确背压行为。
-- **心跳生命周期**：记录心跳、返回确认时序数据，并回收不活跃会话。
-- **协议信封**：提供基于 `serde` 的版本化消息和帧类型。
-- **本地投递**：支持本地用户发送和本地会话广播。
-- **在线路由**：抽象多会话用户路由的注册、续期、查找和删除。
-- **集群发布**：抽象节点间消息发布，可接入 Redis、NATS 或自定义后端。
-- **内存后端**：提供用于测试和示例的内存 presence store。
-
-## 架构
-
-```text
-application
-  |
-web framework adapter
-  |  axum / hyper / tokio-tungstenite
-  |
-rust-wing core
-  |-- protocol: 版本化消息信封和帧类型
-  |-- session: 连接身份、快照、写队列
-  |-- manager: 本地注册表、连接策略、发送和广播
-  |-- cluster: presence store 和 node publisher 抽象
-  |
-cluster backends
-  |-- redis
-  |-- nats
-  |-- memory/testing
-```
-
-## 投递模型
-
-| 步骤 | 责任方 | 说明 |
-| --- | --- | --- |
-| 接入 | `RustWing::accept` | 注册已认证身份并创建会话。 |
-| 写回 | web adapter | 持有 outbound receiver，并把 frame 写入 socket。 |
-| 本地发送 | manager | 优先投递到本地会话。 |
-| 远端路由 | presence store | 查找目标用户所在节点。 |
-| 远端发布 | node publisher | 把 frame 转发到目标节点通道。 |
-| 远端落地 | manager | 处理集群 envelope 并投递到本地会话。 |
+- 用可复用的框架核心承载 WebSocket 连接基础设施。
+- 认证、权限和业务消息处理仍然保留在应用自身。
+- 支持按产品模型选择单端在线或多端在线。
+- 从本地单节点到多节点部署都使用同一套核心 API。
+- Web 框架集成独立于核心模块，便于按需组合。
 
 ## 快速开始
 
-在应用 crate 中添加 RustWing：
+在应用中添加 RustWing：
 
 ```toml
 [dependencies]
-rust-wing = "0.1"
+rust-wing-core = "0.0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-使用核心管理器：
+如果使用下面的扩展示例，再按需添加对应 crate：
+
+```toml
+rust-wing-axum = "0.0.1"
+rust-wing-adapter = { version = "0.0.1", features = ["redis"] }
+axum = { version = "0.8", features = ["ws"] }
+```
+
+创建管理器、接收会话，并向用户发送消息：
 
 ```rust
-use rust_wing::{Identity, OutboundFrame, RustWing, RustWingConfig};
+use rust_wing_core::{Identity, OutboundFrame, RustWing, RustWingConfig};
 
 #[tokio::main]
-async fn main() -> rust_wing::Result<()> {
+async fn main() -> rust_wing_core::Result<()> {
     let wing = RustWing::new(RustWingConfig::default());
     let accepted = wing.accept(Identity::new("alice")).await?;
 
     wing.send_to_user("alice", OutboundFrame::text("hello")).await?;
 
-    // Web 框架适配层会持有这个 receiver，并把 frame 写回 socket。
     let mut outbound = accepted.outbound;
     if let Some(frame) = outbound.recv().await {
         println!("send frame: {:?}", frame.kind);
@@ -97,69 +71,104 @@ async fn main() -> rust_wing::Result<()> {
 }
 ```
 
-## 配置
+## Web 框架用法
 
-| 配置项 | 说明 |
-| --- | --- |
-| `node_id` | 当前节点标识，用于集群路由。 |
-| `heartbeat_interval` | 建议客户端使用的心跳间隔。 |
-| `heartbeat_timeout` | 会话不活跃的超时阈值。 |
-| `write_queue_capacity` | 每个会话的 outbound 队列容量。 |
-| `connection_policy` | `Single` 顶掉旧连接；`Multi` 保留多连接。 |
-| `cluster.enabled` | 是否启用 presence 注册和远端发布。 |
-| `cluster.backend` | 默认选择 `Memory`，也可显式配置 `Redis { url }`。 |
-| `cluster.route_ttl` | presence 路由过期时间。 |
+在应用中先完成认证，构建 `Identity`，再把升级后的连接交给 RustWing：
 
-## 项目结构
+```rust
+use axum::{extract::ws::WebSocketUpgrade, response::Response};
+use rust_wing_axum::upgrade;
+use rust_wing_core::{Identity, RustWing};
 
-```text
-rust-wing/
-├─ src/
-│  ├─ cluster.rs      Presence store 和 node publisher 抽象
-│  ├─ config.rs       框架配置
-│  ├─ error.rs        公共错误类型
-│  ├─ identity.rs     节点、用户、设备和会话 ID
-│  ├─ manager.rs      RustWing 核心管理器
-│  ├─ protocol.rs     消息信封和 outbound frame 类型
-│  ├─ session.rs      会话状态和写队列
-│  └─ lib.rs          crate 公共导出
-├─ tests/             核心行为测试
-├─ README.md
-└─ README_zh.md
+async fn websocket_handler(ws: WebSocketUpgrade, wing: RustWing) -> Response {
+    let identity = Identity::new("alice");
+    upgrade(ws, wing, identity)
+}
 ```
 
-## 开发命令
+如果应用需要处理客户端发来的业务消息，可以使用 `upgrade_with_handler`。
+
+## 分布式用法
+
+当服务部署为多个节点时，RustWing 可以接入外部路由后端：
+
+```rust
+use rust_wing_adapter::{
+    redis_cluster_from_config, RedisPresenceConfig, RedisPublisherConfig,
+};
+use rust_wing_core::{ClusterConfig, RustWing, RustWingConfig};
+
+#[tokio::main]
+async fn main() -> rust_wing_core::Result<()> {
+    let cluster = redis_cluster_from_config(
+        RedisPresenceConfig::new("redis://127.0.0.1:6379"),
+        RedisPublisherConfig::new("redis://127.0.0.1:6379"),
+    )
+    .await?;
+
+    let wing = RustWing::with_cluster(
+        RustWingConfig {
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(cluster),
+    );
+
+    Ok(())
+}
+```
+
+## Workspace
+
+| Crate | 作用 |
+| --- | --- |
+| `rust-wing-core` | 会话、协议消息、路由和连接管理的核心 API。 |
+| `rust-wing-adapter` | 面向外部基础设施的适配器契约和后端实现。 |
+| `rust-wing-axum` | 面向 Axum 应用的 WebSocket 集成。 |
+
+## 配置
+
+常用配置项：
+
+| 字段 | 作用 |
+| --- | --- |
+| `node_id` | 当前服务节点标识。 |
+| `heartbeat_interval` | 建议客户端使用的心跳间隔。 |
+| `heartbeat_timeout` | 不活跃会话的超时时间。 |
+| `write_queue_capacity` | 每个会话的出站队列大小。 |
+| `connection_policy` | 控制用户单端在线或多端在线。 |
+| `cluster.enabled` | 启用分布式路由。 |
+| `cluster.route_ttl` | 分布式路由的过期时间。 |
+
+## 当前状态
+
+RustWing 目前处于早期基础阶段。核心 API 已经可以使用，但在第一个稳定版本前，包名、模块边界和适配器 API 仍可能调整。
+
+## 开发
 
 ```bash
-cargo fmt
-cargo check
+cargo fmt --all
+cargo check --workspace
 cargo test
 ```
 
 ## 路线图
 
-- `axum` WebSocket adapter
-- Redis presence store
-- Redis Pub/Sub node publisher
-- NATS backend
-- 房间、频道、Topic 广播
-- 鉴权中间件
-- metrics 和 tracing 集成
-- examples 和 benchmark
+- 稳定公共 API。
+- 增加完整示例。
+- 扩展更多 Web 框架集成。
+- 完善分布式部署文档。
+- 增加 tracing、metrics 和运维钩子。
+- 增加房间、频道和 topic 辅助能力。
 
-## 安全说明
+## 许可证
 
-RustWing 是框架内核。认证、授权、限流、TLS 终止和公网暴露策略应由应用层或适配层处理。不要在没有清晰认证和资源限制策略的情况下，把 WebSocket 网关暴露到不可信网络。
+本项目使用以下任一许可证：
 
-## Git 注意事项
+- Apache License, Version 2.0
+- MIT license
 
-以下内容属于本地构建产物、IDE 状态或个人助手提示词，不应提交：
-
-- `target/`
-- `.idea/`
-- `.vscode/`
-- `.env`
-- `AGENTS.md`
-- `CLAUDE.md`
-
-如果这些文件已经被 Git 跟踪，仅加入 `.gitignore` 不会自动取消跟踪，需要执行 `git rm --cached` 后再提交。
+详见 [LICENSE](./LICENSE)。
