@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use rust_wing_core::{
-    Cluster, ClusterEnvelope, NodeId, Result, Route, RustWingError, SessionId, UserId,
+    Cluster, ClusterEnvelope, NodeId, Result, Route, RustWing, RustWingError, SessionId, UserId,
 };
 
 use crate::{NodePublisherAdapter, PresenceStoreAdapter, cluster_from_adapters};
@@ -108,6 +109,15 @@ pub struct RedisNodePublisherAdapter {
     // Redis connection manager Redis 连接管理器
     connection: ConnectionManager,
     // Runtime adapter configuration 运行期适配器配置
+    config: RedisPublisherConfig,
+}
+
+// Redis-backed node subscriber adapter Redis 节点消息订阅适配器
+#[derive(Clone)]
+pub struct RedisNodeSubscriberAdapter {
+    // Redis client used to create a dedicated Pub/Sub connection Redis 客户端用于创建专用 Pub/Sub 连接
+    client: redis::Client,
+    // Runtime subscriber configuration 运行期订阅配置
     config: RedisPublisherConfig,
 }
 
@@ -250,6 +260,55 @@ impl NodePublisherAdapter for RedisNodePublisherAdapter {
             .await
             .map_err(|error| redis_error("publish redis cluster envelope", error))?;
         Ok(())
+    }
+}
+
+impl RedisNodeSubscriberAdapter {
+    // Connect to Redis using publisher-compatible channel configuration 使用发布器兼容的频道配置连接 Redis
+    pub async fn connect(config: RedisPublisherConfig) -> Result<Self> {
+        // Validate before creating the reusable client 创建可复用客户端前先校验配置
+        config.validate()?;
+        let client = redis::Client::open(config.url.as_str())
+            .map_err(|error| redis_error("create redis subscriber client", error))?;
+        Ok(Self { client, config })
+    }
+
+    // Borrow the effective Redis subscriber configuration 借用当前 Redis 订阅配置
+    pub fn config(&self) -> &RedisPublisherConfig {
+        &self.config
+    }
+
+    // Consume messages for the manager's configured node 消费管理器当前节点的消息
+    pub async fn run_current_node(&self, wing: RustWing) -> Result<()> {
+        self.run_for_node(wing.config().node_id.clone(), wing).await
+    }
+
+    // Consume messages for one node until the Pub/Sub stream ends 为指定节点持续消费消息直到订阅流结束
+    pub async fn run_for_node(&self, node_id: NodeId, wing: RustWing) -> Result<()> {
+        let channel = self.channel_for_node(&node_id);
+        let mut pubsub = self
+            .client
+            .get_async_pubsub()
+            .await
+            .map_err(|error| redis_error("connect redis subscriber", error))?;
+        // Subscribe before reading so setup messages are handled by the client 先订阅再读取，让客户端处理订阅确认消息
+        pubsub
+            .subscribe(&channel)
+            .await
+            .map_err(|error| redis_error("subscribe redis node channel", error))?;
+
+        let mut messages = pubsub.on_message();
+        while let Some(message) = messages.next().await {
+            let envelope = serde_json::from_slice::<ClusterEnvelope>(message.get_payload_bytes())?;
+            // Deliver the cross-node envelope into local sessions 将跨节点信封投递到本地会话
+            wing.handle_cluster_envelope(envelope)?;
+        }
+        Ok(())
+    }
+
+    // Build the Redis channel for one node 构建单个节点的 Redis 频道
+    fn channel_for_node(&self, node_id: &NodeId) -> String {
+        format!("{}:node:{}", self.config.channel_prefix, node_id.as_str())
     }
 }
 
