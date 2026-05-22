@@ -740,6 +740,7 @@ name = "rust-wing-adapter"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures-util",
  "redis",
  "rust-wing-core",
  "serde_json",

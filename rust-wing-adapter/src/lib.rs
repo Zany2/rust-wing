@@ -13,8 +13,8 @@ pub use presence::{PresenceStoreAdapter, PresenceStoreBridge};
 pub use publisher::{NodePublisherAdapter, NodePublisherBridge};
 #[cfg(feature = "redis")]
 pub use redis::{
-    RedisNodePublisherAdapter, RedisPresenceAdapter, RedisPresenceConfig, RedisPublisherConfig,
-    redis_cluster_from_config,
+    RedisNodePublisherAdapter, RedisNodeSubscriberAdapter, RedisPresenceAdapter,
+    RedisPresenceConfig, RedisPublisherConfig, redis_cluster_from_config,
 };
 
 // Build a RustWing cluster from adapter implementations 从适配器实现构建集群依赖
