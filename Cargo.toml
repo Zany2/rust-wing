@@ -1,6 +1,11 @@
 [workspace]
 default-members = ["rust-wing-core", "rust-wing-adapter", "rust-wing-axum"]
-members = ["rust-wing-core", "rust-wing-adapter", "rust-wing-axum"]
+members = [
+    "rust-wing-core",
+    "rust-wing-adapter",
+    "rust-wing-axum",
+    "rust-wing-example",
+]
 resolver = "3"
 
 [workspace.package]

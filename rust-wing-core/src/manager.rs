@@ -52,7 +52,7 @@ impl RustWing {
             return Ok(Self::with_cluster(config, None));
         }
 
-        // Build the selected backend from explicit configuration 依据显式配置构建所选后端
+        // Build the selected backend from explicit configuration 根据显式配置构建所选后端
         let cluster = match &config.cluster.backend {
             ClusterBackendConfig::Memory => Cluster::new(MemoryPresenceStore::new(), NoopPublisher),
             ClusterBackendConfig::Redis { url } if url.trim().is_empty() => {
@@ -112,7 +112,7 @@ impl RustWing {
         // Remove the session from the local registry 从本地注册表移除会话
         self.inner.registry.remove(session);
 
-        // Remove the distributed route when cluster presence is active 当集群在线状态启用时删除分布式路由
+        // Remove the distributed route when cluster presence is active 集群在线状态启用时删除分布式路由
         if let Some(cluster) = &self.inner.cluster {
             if self.inner.config.cluster.enabled {
                 cluster

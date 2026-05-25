@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 
-// Default wire protocol version 默认线协议版本
+// Default wire protocol version 默认线上协议版本
 pub const DEFAULT_PROTOCOL_VERSION: u16 = 1;
 // Heartbeat event name 心跳事件名称
 pub const HEARTBEAT_EVENT: &str = "client_report";
@@ -12,7 +12,7 @@ pub const HEARTBEAT_EVENT: &str = "client_report";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
-    // Client heartbeat 心跳上报
+    // Client heartbeat 客户端心跳上报
     Heartbeat,
     // Heartbeat acknowledgement 心跳确认
     HeartbeatAck,
@@ -195,6 +195,6 @@ pub fn now_millis() -> i64 {
     let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return 0;
     };
-    // Convert the timestamp to the wire format 将时间戳转换为线协议格式
+    // Convert the timestamp to the wire format 将时间戳转换为线上协议格式
     duration.as_millis() as i64
 }

@@ -123,7 +123,6 @@ async fn multi_connection_policy_keeps_all_sessions() {
     );
 }
 
-// Local sessions are preferred before cluster routing 集群路由前优先使用本地会话
 // Concurrent accepts keep registry indexes consistent 并发接入会保持注册表索引一致
 #[tokio::test]
 async fn concurrent_accepts_keep_registry_consistent() {
@@ -158,6 +157,7 @@ async fn concurrent_accepts_keep_registry_consistent() {
     );
 }
 
+// Local sessions are preferred before cluster routing 集群路由前优先使用本地会话
 #[tokio::test]
 async fn send_to_user_prefers_local_session() {
     // Build a manager with one local session 构建包含一个本地会话的管理器

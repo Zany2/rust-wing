@@ -8,7 +8,17 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 // Define a strongly typed string identifier 定义强类型字符串标识
 macro_rules! string_id {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(String);
 
         impl $name {

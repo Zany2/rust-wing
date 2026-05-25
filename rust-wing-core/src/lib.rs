@@ -23,11 +23,12 @@ pub use config::{ClusterBackendConfig, ClusterConfig, ConnectionPolicy, RustWing
 pub use error::{Result, RustWingError};
 // Re-export identity APIs 重导出身份接口
 pub use identity::{DeviceId, Identity, NodeId, SessionId, UserId};
-// Re-export manager API 重导出管理接口
+// Re-export manager API 重导出管理器接口
 pub use manager::RustWing;
 // Re-export protocol APIs 重导出协议接口
 pub use protocol::{
-    FrameKind, HeartbeatAckData, HeartbeatData, MessageType, OutboundFrame, WsMessage,
+    FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData, MessageType, OutboundFrame,
+    WsMessage, now_millis,
 };
 // Re-export session APIs 重导出会话接口
 pub use session::{AcceptedSession, Session, SessionSnapshot};
