@@ -2,11 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Result;
+use crate::identity::MessageId;
 
 // Default wire protocol version 默认线上协议版本
 pub const DEFAULT_PROTOCOL_VERSION: u16 = 1;
 // Heartbeat event name 心跳事件名称
 pub const HEARTBEAT_EVENT: &str = "client_report";
+// Delivery acknowledgement event name 投递确认事件名称
+pub const ACK_EVENT: &str = "ack";
 
 // Logical message category 逻辑消息类别
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,12 +19,24 @@ pub enum MessageType {
     Heartbeat,
     // Heartbeat acknowledgement 心跳确认
     HeartbeatAck,
+    // Delivery acknowledgement 投递确认
+    Ack,
     // Business event 业务事件
     Event,
     // Server-side system event 服务端系统事件
     System,
     // Error response 错误响应
     Error,
+}
+
+// Delivery acknowledgement stage 投递确认阶段
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckStage {
+    // Client received the message 客户端已收到消息
+    ClientReceived,
+    // Client business logic processed the message 客户端业务逻辑已处理消息
+    BusinessProcessed,
 }
 
 // WebSocket frame category WebSocket 帧类别
@@ -32,6 +47,10 @@ pub enum FrameKind {
     Text,
     // Binary payload 二进制负载
     Binary,
+    // Ping control frame Ping 控制帧
+    Ping,
+    // Pong control frame Pong 控制帧
+    Pong,
     // Close control frame 关闭控制帧
     Close,
 }
@@ -54,6 +73,9 @@ pub struct WsMessage {
     // Client request correlation id 客户端请求关联标识
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    // Server message id for optional acknowledgement 服务端消息确认使用的消息标识
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
     // Distributed tracing id 分布式追踪标识
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
@@ -100,6 +122,18 @@ pub struct HeartbeatAckData {
     pub heartbeat_timeout_ms: u64,
 }
 
+// Delivery acknowledgement payload 投递确认负载
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckData {
+    // Acknowledged message identifier 已确认的消息标识
+    pub message_id: MessageId,
+    // Acknowledgement stage 确认阶段
+    pub stage: AckStage,
+    // Optional client-side timestamp 可选客户端时间戳
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_time: Option<i64>,
+}
+
 // Frame queued for outbound delivery 待发送的出站帧
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundFrame {
@@ -107,6 +141,9 @@ pub struct OutboundFrame {
     pub kind: FrameKind,
     // Frame payload 帧负载
     pub payload: Vec<u8>,
+    // Optional message id expected to be acknowledged 期望被确认的可选消息标识
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
 }
 
 impl WsMessage {
@@ -117,6 +154,7 @@ impl WsMessage {
             message_type: MessageType::Event,
             event: Some(event.into()),
             request_id: None,
+            message_id: None,
             trace_id: None,
             seq: None,
             client_time: None,
@@ -134,6 +172,7 @@ impl WsMessage {
             message_type: MessageType::System,
             event: Some(event.into()),
             request_id: None,
+            message_id: None,
             trace_id: None,
             seq: None,
             client_time: None,
@@ -149,6 +188,7 @@ impl WsMessage {
         Ok(OutboundFrame {
             kind: FrameKind::Text,
             payload: serde_json::to_vec(self)?,
+            message_id: self.message_id.clone(),
         })
     }
 }
@@ -159,6 +199,7 @@ impl OutboundFrame {
         Self {
             kind: FrameKind::Text,
             payload: payload.into(),
+            message_id: None,
         }
     }
 
@@ -167,6 +208,25 @@ impl OutboundFrame {
         Self {
             kind: FrameKind::Binary,
             payload: payload.into(),
+            message_id: None,
+        }
+    }
+
+    // Build a ping frame 构建 Ping 帧
+    pub fn ping(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: FrameKind::Ping,
+            payload: payload.into(),
+            message_id: None,
+        }
+    }
+
+    // Build a pong frame 构建 Pong 帧
+    pub fn pong(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: FrameKind::Pong,
+            payload: payload.into(),
+            message_id: None,
         }
     }
 
@@ -175,7 +235,14 @@ impl OutboundFrame {
         Self {
             kind: FrameKind::Close,
             payload: reason.into(),
+            message_id: None,
         }
+    }
+
+    // Mark this frame as requiring acknowledgement 标记该帧需要确认
+    pub fn require_ack(mut self, message_id: impl Into<MessageId>) -> Self {
+        self.message_id = Some(message_id.into());
+        self
     }
 }
 

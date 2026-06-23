@@ -1,13 +1,14 @@
-use std::sync::{Arc, Mutex};
+﻿use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_wing_adapter::{
     MemoryPresenceAdapter, NodePublisherAdapter, PresenceStoreAdapter, cluster_from_adapters,
+    rust_wing_from_adapters,
 };
 use rust_wing_core::{
-    ClusterConfig, ClusterEnvelope, NodeId, OutboundFrame, Result, Route, RustWing, RustWingConfig,
-    UserId,
+    ClusterConfig, ClusterEnvelope, ConnectionType, NodeId, OutboundFrame, Result, Route, RustWing,
+    RustWingConfig, UserId,
 };
 
 // Memory adapter can be bridged into the core cluster 内存适配器可桥接到核心集群
@@ -18,7 +19,9 @@ async fn memory_adapter_bridges_into_core_cluster() {
     presence
         .register(
             Route {
+                connection_type: ConnectionType::from("default"),
                 user_id: UserId::from("alice"),
+                client_id: None,
                 session_id: "remote-session".into(),
                 node_id: NodeId::from("node-b"),
             },
@@ -31,7 +34,7 @@ async fn memory_adapter_bridges_into_core_cluster() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = cluster_from_adapters(presence, publisher);
-    let wing = RustWing::with_cluster(
+    let wing = RustWing::with_cluster_unchecked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -44,14 +47,57 @@ async fn memory_adapter_bridges_into_core_cluster() {
     );
 
     // Send through the cluster route 通过集群路由发送消息
-    let sent = wing
+    let report = wing
         .send_to_user("alice", OutboundFrame::text("hello"))
         .await
         .unwrap();
 
     // Confirm the bridged publisher received the message 确认桥接发布器收到消息
     let published = published.lock().unwrap();
-    assert_eq!(sent, 1);
+    assert_eq!(report.local_sessions, 0);
+    assert_eq!(report.remote_nodes, 1);
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].0, NodeId::from("node-b"));
+}
+
+// RustWing can be built from independently selected adapters RustWing 可以通过独立选择的适配器构建
+#[tokio::test]
+async fn rust_wing_from_adapters_composes_presence_and_publisher() {
+    // Seed a remote route in the selected presence store 在选定路由存储中写入远端路由
+    let presence = MemoryPresenceAdapter::new();
+    presence
+        .register(
+            Route {
+                connection_type: ConnectionType::from("default"),
+                user_id: UserId::from("alice"),
+                client_id: None,
+                session_id: "remote-session".into(),
+                node_id: NodeId::from("node-b"),
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    // Use an independently selected publisher 使用独立选择的发布器
+    let publisher = RecordingPublisher::default();
+    let published = publisher.published.clone();
+    let wing = rust_wing_from_adapters(
+        RustWingConfig::default().with_node_id("node-a"),
+        presence,
+        publisher,
+    )
+    .await
+    .unwrap();
+
+    let report = wing
+        .send_to_user("alice", OutboundFrame::text("hello"))
+        .await
+        .unwrap();
+
+    let published = published.lock().unwrap();
+    assert_eq!(report.local_sessions, 0);
+    assert_eq!(report.remote_nodes, 1);
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].0, NodeId::from("node-b"));
 }

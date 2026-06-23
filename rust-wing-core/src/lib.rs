@@ -15,20 +15,21 @@ pub mod session;
 
 // Re-export cluster APIs 重导出集群接口
 pub use cluster::{
-    Cluster, ClusterEnvelope, MemoryPresenceStore, NodePublisher, PresenceStore, Route,
+    Cluster, ClusterEnvelope, ClusterTarget, MemoryPresenceStore, NodeLease, NodePublisher,
+    PresenceStore, Route,
 };
 // Re-export config APIs 重导出配置接口
-pub use config::{ClusterBackendConfig, ClusterConfig, ConnectionPolicy, RustWingConfig};
+pub use config::{ClusterConfig, ConnectionPolicy, MaintenanceConfig, RustWingConfig};
 // Re-export error APIs 重导出错误接口
 pub use error::{Result, RustWingError};
 // Re-export identity APIs 重导出身份接口
-pub use identity::{DeviceId, Identity, NodeId, SessionId, UserId};
+pub use identity::{ClientId, ConnectionType, Identity, MessageId, NodeId, SessionId, UserId};
 // Re-export manager API 重导出管理器接口
-pub use manager::RustWing;
+pub use manager::{AckSnapshot, DeliveryReport, RustWing, SessionAckSnapshot, StatsSnapshot};
 // Re-export protocol APIs 重导出协议接口
 pub use protocol::{
-    FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData, MessageType, OutboundFrame,
-    WsMessage, now_millis,
+    ACK_EVENT, AckData, AckStage, FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData,
+    MessageType, OutboundFrame, WsMessage, now_millis,
 };
 // Re-export session APIs 重导出会话接口
 pub use session::{AcceptedSession, Session, SessionSnapshot};

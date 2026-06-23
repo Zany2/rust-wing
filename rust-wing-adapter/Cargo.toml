@@ -7,14 +7,22 @@ license.workspace = true
 
 [features]
 default = []
-redis = ["dep:futures-util", "dep:redis"]
+kafka = ["dep:futures-util", "dep:rdkafka", "dep:tokio"]
+nats = ["dep:async-nats", "dep:futures-util", "dep:tokio"]
+redis = ["dep:futures-util", "dep:redis", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
+async-nats = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 rust-wing-core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

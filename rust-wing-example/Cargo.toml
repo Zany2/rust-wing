@@ -7,8 +7,13 @@ publish = false
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
+rust-wing-adapter = { path = "../rust-wing-adapter", features = ["redis"], optional = true }
 rust-wing-axum = { path = "../rust-wing-axum" }
 rust-wing-core = { path = "../rust-wing-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+redis = ["dep:rust-wing-adapter"]

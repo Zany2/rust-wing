@@ -1,9 +1,4 @@
 use std::fmt::{self, Display};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-// Monotonic session sequence source 单调递增的会话序列源
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // Define a strongly typed string identifier 定义强类型字符串标识
 macro_rules! string_id {
@@ -65,47 +60,70 @@ macro_rules! string_id {
 string_id!(NodeId);
 // Session identifier 会话标识
 string_id!(SessionId);
+// Message identifier 消息标识
+string_id!(MessageId);
+// Connection type identifier 连接体系标识
+string_id!(ConnectionType);
 // User identifier 用户标识
 string_id!(UserId);
-// Device identifier 设备标识
-string_id!(DeviceId);
+// Client identifier 客户端标识
+string_id!(ClientId);
+
+impl Default for ConnectionType {
+    // Use the default connection type when callers do not need multiple systems 调用方不需要多体系时使用默认连接体系
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
 
 // Logical client identity 逻辑客户端身份
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
+    // Connection system identifier 连接体系标识
+    pub connection_type: ConnectionType,
     // Owning user identifier 所属用户标识
     pub user_id: UserId,
-    // Optional device identifier 可选设备标识
-    pub device_id: Option<DeviceId>,
+    // Optional client identifier 可选客户端标识
+    pub client_id: Option<ClientId>,
 }
 
 impl Identity {
-    // Create an identity for one user 为单个用户创建身份
-    pub fn new(user_id: impl Into<UserId>) -> Self {
+    // Create an identity in one connection system 在指定连接体系中创建身份
+    pub fn new(connection_type: impl Into<ConnectionType>, user_id: impl Into<UserId>) -> Self {
         Self {
+            connection_type: connection_type.into(),
             user_id: user_id.into(),
-            device_id: None,
+            client_id: None,
         }
     }
 
-    // Attach a device identifier to the identity 为身份附加设备标识
-    pub fn with_device(mut self, device_id: impl Into<DeviceId>) -> Self {
-        self.device_id = Some(device_id.into());
+    // Create an identity in the default connection system 在默认连接体系中创建身份
+    pub fn default_connection(user_id: impl Into<UserId>) -> Self {
+        Self::new(ConnectionType::default(), user_id)
+    }
+
+    // Attach a client identifier to the identity 为身份附加客户端标识
+    pub fn with_client(mut self, client_id: impl Into<ClientId>) -> Self {
+        self.client_id = Some(client_id.into());
         self
     }
 }
 
 impl SessionId {
-    // Generate a mostly unique session identifier 生成基本唯一的会话标识
+    // Generate a node-scoped time-ordered session identifier 生成带节点前缀且按时间大致有序的会话标识
     pub fn generate(node_id: &NodeId) -> Self {
-        // Capture the current epoch timestamp 获取当前纪元时间戳
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        // Reserve the next local sequence value 预留下一个本地序列值
-        let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Combine node, time, and sequence into one identifier 合并节点、时间和序列生成标识
-        Self(format!("{}-{}-{}", node_id.as_str(), millis, sequence))
+        Self(format!("{}-{}", node_id.as_str(), uuid_v7_simple()))
     }
+}
+
+impl MessageId {
+    // Generate a node-scoped time-ordered message identifier 生成带节点前缀且按时间大致有序的消息标识
+    pub fn generate(node_id: &NodeId) -> Self {
+        Self(format!("{}-{}", node_id.as_str(), uuid_v7_simple()))
+    }
+}
+
+// Generate a hyphen-free UUID v7 text value 生成不带连字符的 UUID v7 文本值
+pub(crate) fn uuid_v7_simple() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
 }
