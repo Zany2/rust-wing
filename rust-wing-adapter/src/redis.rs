@@ -432,7 +432,12 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
                 .await
                 .map_err(|error| redis_error("locate redis presence session route", error))?;
             match payload {
-                Some(payload) => routes.push(serde_json::from_slice(&payload)?),
+                Some(payload) => {
+                    let route: Route = serde_json::from_slice(&payload)?;
+                    if self.route_node_is_live(&mut connection, &route).await? {
+                        routes.push(route);
+                    }
+                }
                 None => stale_fields.push(field),
             }
         }
@@ -455,9 +460,15 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
             .get::<_, Option<Vec<u8>>>(key)
             .await
             .map_err(|error| redis_error("locate redis presence session route", error))?;
-        payload
-            .map(|payload| serde_json::from_slice(&payload).map_err(RustWingError::from))
-            .transpose()
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let route: Route = serde_json::from_slice(&payload)?;
+        if self.route_node_is_live(&mut connection, &route).await? {
+            Ok(Some(route))
+        } else {
+            Ok(None)
+        }
     }
 
     // List live routes in one connection system from Redis 从 Redis 列出某个连接体系中的活跃路由

@@ -982,7 +982,7 @@ async fn cluster_status_omits_expired_routes() {
     assert!(wing.list_all_cluster_routes().await.unwrap().is_empty());
 }
 
-// Client-targeted sends reach only the matching client 瀹㈡埛绔畾鍚戝彂閫佸彧浼氬懡涓尮閰嶅鎴风
+// Client-targeted sends reach only the matching client 客户端定向发送只会命中匹配客户端
 #[tokio::test]
 async fn send_to_client_counts_matching_local_sessions() {
     let wing = RustWing::new(

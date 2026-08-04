@@ -109,7 +109,16 @@ pub(super) async fn broadcast(
         request.require_ack,
         request.message_id.as_deref(),
     );
-    let report = state.wing.broadcast(frame).await.map_err(send_api_error)?;
+    let report = match request.connection_type {
+        Some(connection_type) => {
+            state
+                .wing
+                .broadcast_in(ConnectionType::from(connection_type), frame)
+                .await
+        }
+        None => state.wing.broadcast(frame).await,
+    }
+    .map_err(send_api_error)?;
     Ok(Json(send_response(report, message_id)))
 }
 

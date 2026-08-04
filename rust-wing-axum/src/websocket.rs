@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use rust_wing_core::{
@@ -260,7 +260,10 @@ pub(crate) fn axum_message_from_frame(frame: OutboundFrame) -> Message {
         FrameKind::Binary => Message::Binary(frame.payload.into()),
         FrameKind::Ping => Message::Ping(frame.payload.into()),
         FrameKind::Pong => Message::Pong(frame.payload.into()),
-        FrameKind::Close => Message::Close(None),
+        FrameKind::Close => Message::Close(Some(CloseFrame {
+            code: close_code::NORMAL,
+            reason: String::from_utf8_lossy(&frame.payload).into_owned().into(),
+        })),
     }
 }
 

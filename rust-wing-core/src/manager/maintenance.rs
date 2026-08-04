@@ -15,6 +15,10 @@ impl RustWing {
         if !self.inner.config.maintenance.enabled {
             return;
         }
+        // Skip background maintenance outside Tokio runtimes 避免在 Tokio 运行时外启动后台维护
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let (maintenance_stop, stop_rx) = watch::channel(false);
         {
             let Some(inner) = Arc::get_mut(&mut self.inner) else {

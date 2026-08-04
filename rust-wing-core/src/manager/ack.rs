@@ -223,6 +223,8 @@ impl AckTracker {
         }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let notified = entry.notify.notified();
+            tokio::pin!(notified);
             let snapshot = self.snapshot(message_id)?;
             if snapshot
                 .as_ref()
@@ -236,7 +238,7 @@ impl AckTracker {
             }
             let remaining = deadline.saturating_duration_since(now);
             tokio::select! {
-                _ = entry.notify.notified() => {}
+                _ = &mut notified => {}
                 _ = tokio::time::sleep(remaining) => {
                     return self.snapshot(message_id);
                 }

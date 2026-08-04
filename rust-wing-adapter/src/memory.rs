@@ -138,14 +138,19 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
         };
         // Remove stale entries before returning live routes 返回前先移除过期条目
         let now = Instant::now();
+        let live_nodes = self.live_node_ids(now)?;
         entries.retain(|_, entry| entry.expires_at > now);
         // Drop empty user buckets after cleanup 清理后移除空的用户路由桶
         if entries.is_empty() {
             routes.remove(&key);
             return Ok(Vec::new());
         }
-        // Clone live routes for the caller 为调用方复制活跃路由
-        Ok(entries.values().map(|entry| entry.route.clone()).collect())
+        // Clone routes owned by live nodes for the caller 为调用方复制活跃节点拥有的路由
+        Ok(entries
+            .values()
+            .filter(|entry| live_nodes.contains(&entry.route.node_id))
+            .map(|entry| entry.route.clone())
+            .collect())
     }
 
     // Locate one current route by session id 按会话标识查询当前路由
@@ -156,6 +161,7 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
             .write()
             .map_err(|_| RustWingError::Cluster("presence adapter lock poisoned".into()))?;
         let now = Instant::now();
+        let live_nodes = self.live_node_ids(now)?;
         let keys = routes.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             let Some(entries) = routes.get_mut(&key) else {
@@ -163,7 +169,10 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
             };
             entries.retain(|_, entry| entry.expires_at > now);
             if let Some(entry) = entries.get(session_id) {
-                return Ok(Some(entry.route.clone()));
+                if live_nodes.contains(&entry.route.node_id) {
+                    return Ok(Some(entry.route.clone()));
+                }
+                return Ok(None);
             }
             if entries.is_empty() {
                 routes.remove(&key);
