@@ -23,13 +23,13 @@ pub use config::{ClusterConfig, ConnectionPolicy, MaintenanceConfig, RustWingCon
 // Re-export error APIs 重导出错误接口
 pub use error::{Result, RustWingError};
 // Re-export identity APIs 重导出身份接口
-pub use identity::{ClientId, ConnectionType, Identity, MessageId, NodeId, SessionId, UserId};
+pub use identity::{ClientId, ConnectionType, Identity, NodeId, SessionId, UserId};
 // Re-export manager API 重导出管理器接口
-pub use manager::{AckSnapshot, DeliveryReport, RustWing, SessionAckSnapshot, StatsSnapshot};
+pub use manager::{DeliveryReport, RustWing, StatsSnapshot};
 // Re-export protocol APIs 重导出协议接口
 pub use protocol::{
-    ACK_EVENT, AckData, AckStage, FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData,
-    MessageType, OutboundFrame, WsMessage, now_millis,
+    FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData, MessageType, OutboundFrame,
+    WsMessage, now_millis,
 };
 // Re-export session APIs 重导出会话接口
 pub use session::{AcceptedSession, Session, SessionSnapshot};

@@ -2,17 +2,17 @@ mod handlers;
 mod types;
 
 pub use types::{
-    AckApiResponse, AckSessionApiResponse, AxumSendApiState, BroadcastRequest, SendApiResponse,
-    SendToClientRequest, SendToSessionRequest, SendToUserRequest, WaitForAckRequest,
+    AxumSendApiState, BroadcastRequest, SendApiResponse, SendToClientRequest, SendToSessionRequest,
+    SendToUserRequest,
 };
 
 use axum::Router;
 use axum::routing::{get, post};
 use handlers::{
     broadcast, broadcast_all, disconnect_client, disconnect_session, disconnect_system_client,
-    disconnect_system_user, disconnect_user, get_ack_snapshot, get_cluster_nodes,
-    get_cluster_routes, get_stats, get_system_cluster_routes, send_to_client, send_to_session,
-    send_to_system_broadcast, send_to_system_user, send_to_user, wait_for_ack,
+    disconnect_system_user, disconnect_user, get_cluster_nodes, get_cluster_routes, get_stats,
+    get_system_cluster_routes, send_to_client, send_to_session, send_to_system_broadcast,
+    send_to_system_user, send_to_user,
 };
 // Build a router for external message sending 构建外部消息发送路由器
 pub fn send_api_router(
@@ -41,8 +41,6 @@ pub fn send_api_router_with_state(state: AxumSendApiState) -> Router {
         .route("/disconnect/user", post(disconnect_user))
         .route("/disconnect/client", post(disconnect_client))
         .route("/disconnect/session", post(disconnect_session))
-        .route("/ack/{message_id}", get(get_ack_snapshot))
-        .route("/ack/wait", post(wait_for_ack))
         .route("/stats", get(get_stats))
         .route("/cluster/nodes", get(get_cluster_nodes))
         .route("/cluster/routes", get(get_cluster_routes))

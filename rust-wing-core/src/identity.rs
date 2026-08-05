@@ -60,8 +60,6 @@ macro_rules! string_id {
 string_id!(NodeId);
 // Session identifier 会话标识
 string_id!(SessionId);
-// Message identifier 消息标识
-string_id!(MessageId);
 // Connection type identifier 连接体系标识
 string_id!(ConnectionType);
 // User identifier 用户标识
@@ -73,6 +71,13 @@ impl Default for ConnectionType {
     // Use the default connection type when callers do not need multiple systems 调用方不需要多体系时使用默认连接体系
     fn default() -> Self {
         Self::new("default")
+    }
+}
+
+impl NodeId {
+    // Generate a practically unique node identifier 生成实际使用中唯一的节点标识
+    pub fn generate() -> Self {
+        Self(format!("node-{}", uuid_v7_simple()))
     }
 }
 
@@ -111,13 +116,6 @@ impl Identity {
 
 impl SessionId {
     // Generate a node-scoped time-ordered session identifier 生成带节点前缀且按时间大致有序的会话标识
-    pub fn generate(node_id: &NodeId) -> Self {
-        Self(format!("{}-{}", node_id.as_str(), uuid_v7_simple()))
-    }
-}
-
-impl MessageId {
-    // Generate a node-scoped time-ordered message identifier 生成带节点前缀且按时间大致有序的消息标识
     pub fn generate(node_id: &NodeId) -> Self {
         Self(format!("{}-{}", node_id.as_str(), uuid_v7_simple()))
     }

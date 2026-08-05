@@ -17,6 +17,14 @@ async fn memory_adapter_bridges_into_core_cluster() {
     // Seed a remote route through the adapter 通过适配器写入远端路由
     let presence = MemoryPresenceAdapter::new();
     presence
+        .register_node(
+            &NodeId::from("node-b"),
+            "instance-node-b",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    presence
         .register(
             Route {
                 connection_type: ConnectionType::from("default"),
@@ -34,7 +42,7 @@ async fn memory_adapter_bridges_into_core_cluster() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = cluster_from_adapters(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -44,7 +52,9 @@ async fn memory_adapter_bridges_into_core_cluster() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     // Send through the cluster route 通过集群路由发送消息
     let report = wing
@@ -65,6 +75,14 @@ async fn memory_adapter_bridges_into_core_cluster() {
 async fn rust_wing_from_adapters_composes_presence_and_publisher() {
     // Seed a remote route in the selected presence store 在选定路由存储中写入远端路由
     let presence = MemoryPresenceAdapter::new();
+    presence
+        .register_node(
+            &NodeId::from("node-b"),
+            "instance-node-b",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     presence
         .register(
             Route {

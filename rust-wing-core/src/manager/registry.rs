@@ -129,7 +129,6 @@ impl Registry {
             .len()
     }
 
-    // Snapshot all local sessions in one connection system 获取某个连接体系的全部本地会话快照
     // Snapshot a bounded session window for sharded maintenance 为分片维护获取有界会话窗口
     pub(super) fn session_window(&self, start: usize, limit: usize) -> Vec<Session> {
         if limit == 0 {
@@ -169,6 +168,7 @@ impl Registry {
         sessions
     }
 
+    // List sessions in one connection system 列出某个连接体系中的全部会话
     pub(super) fn sessions_for_connection_type(
         &self,
         connection_type: &ConnectionType,

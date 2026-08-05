@@ -1,14 +1,18 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection};
+use redis::cluster::ClusterClient;
+use redis::cluster_async::ClusterConnection;
+use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
 use rust_wing_core::{
     Cluster, ClusterEnvelope, ConnectionType, NodeId, NodeLease, Result, Route, RustWing,
     RustWingConfig, RustWingError, SessionId, UserId,
 };
-use tokio::sync::watch;
+use tokio::sync::{Mutex, RwLock, watch};
 use tokio::task::JoinHandle;
 
 use crate::{NodePublisherAdapter, PresenceStoreAdapter, cluster_from_adapters};
@@ -17,12 +21,48 @@ use crate::{NodePublisherAdapter, PresenceStoreAdapter, cluster_from_adapters};
 const REDIS_SUBSCRIBER_RECONNECT_BASE_MS: u64 = 100;
 // Maximum Redis subscriber reconnect delay in milliseconds Redis 订阅重连最大退避毫秒数
 const REDIS_SUBSCRIBER_RECONNECT_MAX_MS: u64 = 5_000;
+// Refresh a lease only while the expected instance still owns it 仅在预期实例仍持有时刷新租约
+const REDIS_COMPARE_AND_EXPIRE_SCRIPT: &str = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end";
+// Delete a lease only while the expected instance still owns it 仅在预期实例仍持有时删除租约
+const REDIS_COMPARE_AND_DELETE_SCRIPT: &str = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
+
+// Redis deployment mode shared by presence and message adapters Redis 在线路由与消息适配器共用的部署模式
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedisDeployment {
+    // One standalone Redis endpoint 单个 Redis 服务地址
+    Standalone {
+        // Redis URL, for example redis://default:password@127.0.0.1:6379/0 Redis 连接地址
+        url: String,
+    },
+    // Redis Cluster seed endpoints Redis Cluster 种子地址
+    Cluster {
+        // Redis Cluster seed URLs Redis Cluster 种子地址列表
+        urls: Vec<String>,
+    },
+    // Redis Sentinel deployment Redis Sentinel 部署
+    Sentinel(RedisSentinelConfig),
+}
+
+// Redis Sentinel discovery and master connection configuration Redis Sentinel 发现与主节点连接配置
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisSentinelConfig {
+    // Sentinel seed URLs Sentinel 种子地址列表
+    pub urls: Vec<String>,
+    // Sentinel service or master name Sentinel 服务或主节点名称
+    pub service_name: String,
+    // Optional Redis master ACL username 可选 Redis 主节点 ACL 用户名
+    pub redis_username: Option<String>,
+    // Optional Redis master password 可选 Redis 主节点密码
+    pub redis_password: Option<String>,
+    // Redis master database number Redis 主节点数据库编号
+    pub redis_database: i64,
+}
 
 // Redis presence adapter configuration Redis 在线路由适配器配置
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisPresenceConfig {
-    // Redis connection URL Redis 连接地址
-    pub url: String,
+    // Redis deployment used for route storage 在线路由存储使用的 Redis 部署
+    pub deployment: RedisDeployment,
     // Key prefix shared by all presence keys 所有在线路由 key 的统一前缀
     pub key_prefix: String,
 }
@@ -30,17 +70,108 @@ pub struct RedisPresenceConfig {
 // Redis node publisher adapter configuration Redis 节点发布适配器配置
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisPublisherConfig {
-    // Redis connection URL Redis 连接地址
-    pub url: String,
+    // Redis deployment used for node messages 节点消息使用的 Redis 部署
+    pub deployment: RedisDeployment,
     // Channel prefix shared by all node channels 所有节点频道的统一前缀
     pub channel_prefix: String,
+}
+
+impl RedisDeployment {
+    // Create a standalone Redis deployment 创建单节点 Redis 部署
+    pub fn standalone(url: impl Into<String>) -> Self {
+        Self::Standalone { url: url.into() }
+    }
+
+    // Create a Redis Cluster deployment from seed URLs 通过种子地址创建 Redis Cluster 部署
+    pub fn cluster(urls: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Cluster {
+            urls: urls.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    // Create a Redis Sentinel deployment 创建 Redis Sentinel 部署
+    pub fn sentinel(config: RedisSentinelConfig) -> Self {
+        Self::Sentinel(config)
+    }
+
+    // Validate deployment-specific connection settings 校验部署模式相关连接配置
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Standalone { url } => validate_redis_urls(std::slice::from_ref(url), "url"),
+            Self::Cluster { urls } => validate_redis_urls(urls, "cluster urls"),
+            Self::Sentinel(config) => config.validate(),
+        }
+    }
+}
+
+impl RedisSentinelConfig {
+    // Create Redis Sentinel configuration 创建 Redis Sentinel 配置
+    pub fn new(
+        urls: impl IntoIterator<Item = impl Into<String>>,
+        service_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            urls: urls.into_iter().map(Into::into).collect(),
+            service_name: service_name.into(),
+            redis_username: None,
+            redis_password: None,
+            redis_database: 0,
+        }
+    }
+
+    // Set Redis master ACL credentials 设置 Redis 主节点 ACL 凭据
+    pub fn with_redis_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.redis_username = Some(username.into());
+        self.redis_password = Some(password.into());
+        self
+    }
+
+    // Set a password without an ACL username 设置不带 ACL 用户名的密码
+    pub fn with_redis_password(mut self, password: impl Into<String>) -> Self {
+        self.redis_password = Some(password.into());
+        self
+    }
+
+    // Set the Redis master database number 设置 Redis 主节点数据库编号
+    pub fn with_redis_database(mut self, database: i64) -> Self {
+        self.redis_database = database;
+        self
+    }
+
+    // Validate Sentinel discovery and master settings 校验 Sentinel 发现与主节点配置
+    pub fn validate(&self) -> Result<()> {
+        validate_redis_urls(&self.urls, "sentinel urls")?;
+        if self.service_name.trim().is_empty() {
+            return Err(RustWingError::InvalidConfig(
+                "redis sentinel service_name cannot be empty".into(),
+            ));
+        }
+        if self.redis_database < 0 {
+            return Err(RustWingError::InvalidConfig(
+                "redis sentinel database cannot be negative".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RedisPresenceConfig {
     // Create Redis presence configuration 创建 Redis 在线路由配置
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            url: url.into(),
+            deployment: RedisDeployment::standalone(url),
+            key_prefix: "rust-wing".into(),
+        }
+    }
+
+    // Create Redis presence configuration for a deployment 为指定 Redis 部署创建在线路由配置
+    pub fn from_deployment(deployment: RedisDeployment) -> Self {
+        Self {
+            deployment,
             key_prefix: "rust-wing".into(),
         }
     }
@@ -53,16 +184,14 @@ impl RedisPresenceConfig {
 
     // Validate required Redis configuration 校验必填 Redis 配置
     pub fn validate(&self) -> Result<()> {
-        // Require an explicit URL so startup failures are clear 要求显式地址以便启动失败清晰
-        if self.url.trim().is_empty() {
-            return Err(RustWingError::InvalidConfig(
-                "redis presence url cannot be empty".into(),
-            ));
-        }
+        self.deployment.validate()?;
         // Keep generated Redis keys namespaced 保持生成的 Redis key 有命名空间
-        if self.key_prefix.trim().is_empty() {
+        if self.key_prefix.trim().is_empty()
+            || self.key_prefix.contains('{')
+            || self.key_prefix.contains('}')
+        {
             return Err(RustWingError::InvalidConfig(
-                "redis presence key_prefix cannot be empty".into(),
+                "redis presence key_prefix cannot be empty or contain braces".into(),
             ));
         }
         Ok(())
@@ -73,7 +202,15 @@ impl RedisPublisherConfig {
     // Create Redis publisher configuration 创建 Redis 发布器配置
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            url: url.into(),
+            deployment: RedisDeployment::standalone(url),
+            channel_prefix: "rust-wing".into(),
+        }
+    }
+
+    // Create Redis publisher configuration for a deployment 为指定 Redis 部署创建发布配置
+    pub fn from_deployment(deployment: RedisDeployment) -> Self {
+        Self {
+            deployment,
             channel_prefix: "rust-wing".into(),
         }
     }
@@ -86,12 +223,7 @@ impl RedisPublisherConfig {
 
     // Validate required Redis publisher configuration 校验必填 Redis 发布配置
     pub fn validate(&self) -> Result<()> {
-        // Require an explicit URL so startup failures are clear 要求显式地址以便启动失败清晰
-        if self.url.trim().is_empty() {
-            return Err(RustWingError::InvalidConfig(
-                "redis publisher url cannot be empty".into(),
-            ));
-        }
+        self.deployment.validate()?;
         // Keep generated Redis channels namespaced 保持生成的 Redis 频道有命名空间
         if self.channel_prefix.trim().is_empty() {
             return Err(RustWingError::InvalidConfig(
@@ -102,11 +234,228 @@ impl RedisPublisherConfig {
     }
 }
 
+// Async command connection selected from the configured Redis deployment 根据 Redis 部署选择的异步命令连接
+#[derive(Clone)]
+enum RedisConnection {
+    // Reconnecting standalone connection 可重连的单节点连接
+    Standalone(ConnectionManager),
+    // Redis Cluster-aware connection Redis Cluster 感知连接
+    Cluster(ClusterConnection),
+    // Sentinel-managed master connection Sentinel 管理的主节点连接
+    Sentinel(SentinelRedisConnection),
+}
+
+// Cached Sentinel master connection plus its resolver Sentinel 主节点缓存连接及其解析器
+#[derive(Clone)]
+struct SentinelRedisConnection {
+    // Shared Sentinel connection state 共享 Sentinel 连接状态
+    inner: Arc<SentinelRedisConnectionInner>,
+}
+
+struct SentinelRedisConnectionInner {
+    // Resolver used to discover the current master 用于发现当前主节点的解析器
+    resolver: Mutex<SentinelClient>,
+    // Cached current-master connection 缓存的当前主节点连接
+    connection: RwLock<MultiplexedConnection>,
+    // Selected Redis database number 选定的 Redis 数据库编号
+    database: i64,
+}
+
+// Pub/Sub connection source selected from the configured deployment 根据部署选择的 Pub/Sub 连接源
+#[derive(Clone)]
+enum RedisSubscriberSource {
+    // Standalone client 单节点客户端
+    Standalone(redis::Client),
+    // Redis Cluster seeds rotated during reconnect Redis Cluster 重连时轮换的种子地址
+    Cluster(Arc<Vec<String>>),
+    // Sentinel resolver used to locate the current master 用于定位当前主节点的 Sentinel 解析器
+    Sentinel(Arc<Mutex<SentinelClient>>),
+}
+
+impl RedisConnection {
+    // Connect using one supported Redis deployment mode 使用受支持的 Redis 部署模式连接
+    async fn connect(deployment: &RedisDeployment, action: &str) -> Result<Self> {
+        deployment.validate()?;
+        match deployment {
+            RedisDeployment::Standalone { url } => {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|error| redis_error("create redis client", error))?;
+                let connection = client
+                    .get_connection_manager()
+                    .await
+                    .map_err(|error| redis_error(action, error))?;
+                Ok(Self::Standalone(connection))
+            }
+            RedisDeployment::Cluster { urls } => {
+                let client = ClusterClient::new(urls.clone())
+                    .map_err(|error| redis_error("create redis cluster client", error))?;
+                let connection = client
+                    .get_async_connection()
+                    .await
+                    .map_err(|error| redis_error(action, error))?;
+                Ok(Self::Cluster(connection))
+            }
+            RedisDeployment::Sentinel(config) => Ok(Self::Sentinel(
+                SentinelRedisConnection::connect(config, action).await?,
+            )),
+        }
+    }
+}
+
+impl ConnectionLike for RedisConnection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        match self {
+            Self::Standalone(connection) => connection.req_packed_command(cmd),
+            Self::Cluster(connection) => connection.req_packed_command(cmd),
+            Self::Sentinel(connection) => connection.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        match self {
+            Self::Standalone(connection) => connection.req_packed_commands(pipeline, offset, count),
+            Self::Cluster(connection) => connection.req_packed_commands(pipeline, offset, count),
+            Self::Sentinel(connection) => connection.req_packed_commands(pipeline, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Self::Standalone(connection) => connection.get_db(),
+            Self::Cluster(connection) => connection.get_db(),
+            Self::Sentinel(connection) => connection.get_db(),
+        }
+    }
+}
+
+impl SentinelRedisConnection {
+    // Discover and connect to the current Sentinel master 发现并连接当前 Sentinel 主节点
+    async fn connect(config: &RedisSentinelConfig, action: &str) -> Result<Self> {
+        let mut resolver = build_sentinel_client(config)?;
+        let connection = resolver
+            .get_async_connection()
+            .await
+            .map_err(|error| redis_error(action, error))?;
+        Ok(Self {
+            inner: Arc::new(SentinelRedisConnectionInner {
+                resolver: Mutex::new(resolver),
+                connection: RwLock::new(connection),
+                database: config.redis_database,
+            }),
+        })
+    }
+
+    // Resolve the latest master and replace the cached connection 解析最新主节点并替换缓存连接
+    async fn refresh(&self) -> redis::RedisResult<MultiplexedConnection> {
+        let mut resolver = self.inner.resolver.lock().await;
+        let connection = resolver.get_async_connection().await?;
+        *self.inner.connection.write().await = connection.clone();
+        Ok(connection)
+    }
+}
+
+impl ConnectionLike for SentinelRedisConnection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        Box::pin(async move {
+            let mut connection = self.inner.connection.read().await.clone();
+            match connection.req_packed_command(cmd).await {
+                Ok(value) => Ok(value),
+                Err(error) if redis_error_requires_master_refresh(&error) => {
+                    let retry = redis_error_is_readonly(&error);
+                    let mut refreshed = self.refresh().await?;
+                    if retry {
+                        refreshed.req_packed_command(cmd).await
+                    } else {
+                        Err(error)
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        Box::pin(async move {
+            let mut connection = self.inner.connection.read().await.clone();
+            match connection
+                .req_packed_commands(pipeline, offset, count)
+                .await
+            {
+                Ok(values) => Ok(values),
+                Err(error) if redis_error_requires_master_refresh(&error) => {
+                    let retry = redis_error_is_readonly(&error);
+                    let mut refreshed = self.refresh().await?;
+                    if retry {
+                        refreshed.req_packed_commands(pipeline, offset, count).await
+                    } else {
+                        Err(error)
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.inner.database
+    }
+}
+
+impl RedisSubscriberSource {
+    // Build a Pub/Sub connection source for one deployment 构建指定部署的 Pub/Sub 连接源
+    fn from_deployment(deployment: &RedisDeployment) -> Result<Self> {
+        deployment.validate()?;
+        match deployment {
+            RedisDeployment::Standalone { url } => redis::Client::open(url.as_str())
+                .map(Self::Standalone)
+                .map_err(|error| redis_error("create redis subscriber client", error)),
+            RedisDeployment::Cluster { urls } => Ok(Self::Cluster(Arc::new(urls.clone()))),
+            RedisDeployment::Sentinel(config) => Ok(Self::Sentinel(Arc::new(Mutex::new(
+                build_sentinel_client(config)?,
+            )))),
+        }
+    }
+
+    // Resolve a client for one subscriber connection attempt 解析一次订阅连接尝试使用的客户端
+    async fn client_for_attempt(&self, attempt: u32) -> Result<redis::Client> {
+        match self {
+            Self::Standalone(client) => Ok(client.clone()),
+            Self::Cluster(urls) => {
+                let index = attempt.saturating_sub(1) as usize % urls.len();
+                redis::Client::open(urls[index].as_str())
+                    .map_err(|error| redis_error("create redis cluster subscriber client", error))
+            }
+            Self::Sentinel(resolver) => resolver
+                .lock()
+                .await
+                .async_get_client()
+                .await
+                .map_err(|error| redis_error("resolve redis sentinel subscriber master", error)),
+        }
+    }
+}
+
 // Redis-backed presence adapter Redis 在线路由存储适配器
 #[derive(Clone)]
 pub struct RedisPresenceAdapter {
-    // Redis connection manager Redis 连接管理器
-    connection: ConnectionManager,
+    // Deployment-aware Redis command connection Redis 部署感知命令连接
+    connection: RedisConnection,
     // Runtime adapter configuration 运行期适配器配置
     config: RedisPresenceConfig,
 }
@@ -114,8 +463,8 @@ pub struct RedisPresenceAdapter {
 // Redis-backed node publisher adapter Redis 节点消息发布适配器
 #[derive(Clone)]
 pub struct RedisNodePublisherAdapter {
-    // Redis connection manager Redis 连接管理器
-    connection: ConnectionManager,
+    // Deployment-aware Redis command connection Redis 部署感知命令连接
+    connection: RedisConnection,
     // Runtime adapter configuration 运行期适配器配置
     config: RedisPublisherConfig,
 }
@@ -123,8 +472,8 @@ pub struct RedisNodePublisherAdapter {
 // Redis-backed node subscriber adapter Redis 节点消息订阅适配器
 #[derive(Clone)]
 pub struct RedisNodeSubscriberAdapter {
-    // Redis client used to create a dedicated Pub/Sub connection Redis 客户端用于创建专用 Pub/Sub 连接
-    client: redis::Client,
+    // Source used to create dedicated Pub/Sub connections 用于创建专用 Pub/Sub 连接的来源
+    source: RedisSubscriberSource,
     // Runtime subscriber configuration 运行期订阅配置
     config: RedisPublisherConfig,
 }
@@ -137,7 +486,6 @@ pub struct RedisClusterParts {
     pub subscriber: RedisNodeSubscriberAdapter,
 }
 
-// Managed Redis subscriber task handle 托管的 Redis 订阅任务句柄
 // Managed Redis-backed RustWing runtime 托管的 Redis 版 RustWing 运行时
 pub struct RedisRustWing {
     // Core connection manager 核心连接管理器
@@ -158,14 +506,8 @@ impl RedisPresenceAdapter {
     pub async fn connect(config: RedisPresenceConfig) -> Result<Self> {
         // Validate before opening network connections 建立网络连接前先校验配置
         config.validate()?;
-        // Create the Redis client from the configured URL 使用配置地址创建 Redis 客户端
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|error| redis_error("create redis client", error))?;
-        // Use a connection manager so transient disconnects can reconnect 使用连接管理器支持临时断线重连
-        let connection = client
-            .get_connection_manager()
-            .await
-            .map_err(|error| redis_error("connect redis presence", error))?;
+        let connection =
+            RedisConnection::connect(&config.deployment, "connect redis presence").await?;
         Ok(Self { connection, config })
     }
 
@@ -194,62 +536,55 @@ impl RedisPresenceAdapter {
         redis_presence_node_lease_key(&self.config.key_prefix, node_id)
     }
 
-    // Build the Redis pattern for all session route keys 构建全部会话路由 Redis key 的匹配模式
-    fn key_for_session_pattern(&self) -> String {
-        format!("{}:presence:session:*", self.config.key_prefix)
+    // Build the Redis set key for all known sessions 构建全部已知会话的 Redis 集合 key
+    fn key_for_sessions(&self) -> String {
+        redis_presence_sessions_key(&self.config.key_prefix)
     }
 
-    // Collect live session routes by scanning session route keys 扫描会话路由 key 以收集活跃路由
+    // Collect live session routes through the session index 通过会话索引收集活跃路由
     async fn collect_session_routes(
         &self,
         connection_type: Option<&ConnectionType>,
     ) -> Result<Vec<Route>> {
         let mut connection = self.connection.clone();
-        let pattern = self.key_for_session_pattern();
-        let mut cursor = 0_u64;
+        let sessions_key = self.key_for_sessions();
+        let session_ids = connection
+            .smembers::<_, Vec<String>>(&sessions_key)
+            .await
+            .map_err(|error| redis_error("list redis presence session index", error))?;
         let mut routes = Vec::new();
-
-        loop {
-            let (next_cursor, keys) = redis::cmd("SCAN")
-                .cursor_arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(100)
-                .query_async::<(u64, Vec<String>)>(&mut connection)
+        let mut stale_session_ids = Vec::new();
+        for session_id in session_ids {
+            let key = self.key_for_session(&SessionId::from(session_id.as_str()));
+            let payload = connection
+                .get::<_, Option<Vec<u8>>>(&key)
                 .await
-                .map_err(|error| redis_error("scan redis presence session routes", error))?;
-
-            for key in keys {
-                let payload = connection
-                    .get::<_, Option<Vec<u8>>>(&key)
-                    .await
-                    .map_err(|error| redis_error("load redis presence session route", error))?;
-                let Some(payload) = payload else {
-                    continue;
-                };
-                let route: Route = serde_json::from_slice(&payload)?;
-                if connection_type.is_some_and(|expected| &route.connection_type != expected) {
-                    continue;
-                }
-                if self.route_node_is_live(&mut connection, &route).await? {
-                    routes.push(route);
-                }
+                .map_err(|error| redis_error("load redis presence session route", error))?;
+            let Some(payload) = payload else {
+                stale_session_ids.push(session_id);
+                continue;
+            };
+            let route: Route = serde_json::from_slice(&payload)?;
+            if connection_type.is_some_and(|expected| &route.connection_type != expected) {
+                continue;
             }
-
-            if next_cursor == 0 {
-                break;
+            if self.route_node_is_live(&mut connection, &route).await? {
+                routes.push(route);
             }
-            cursor = next_cursor;
         }
-
+        if !stale_session_ids.is_empty() {
+            connection
+                .srem::<_, _, ()>(&sessions_key, stale_session_ids)
+                .await
+                .map_err(|error| redis_error("clean redis presence session index", error))?;
+        }
         Ok(routes)
     }
 
     // Check whether the route owner still has an active node lease 检查路由所属节点是否仍有活跃租约
     async fn route_node_is_live(
         &self,
-        connection: &mut ConnectionManager,
+        connection: &mut RedisConnection,
         route: &Route,
     ) -> Result<bool> {
         let lease_key = self.key_for_node_lease(&route.node_id);
@@ -265,14 +600,8 @@ impl RedisNodePublisherAdapter {
     pub async fn connect(config: RedisPublisherConfig) -> Result<Self> {
         // Validate before opening network connections 建立网络连接前先校验配置
         config.validate()?;
-        // Create the Redis client from the configured URL 使用配置地址创建 Redis 客户端
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|error| redis_error("create redis client", error))?;
-        // Use a connection manager so publish calls can reconnect 使用连接管理器支持发布调用重连
-        let connection = client
-            .get_connection_manager()
-            .await
-            .map_err(|error| redis_error("connect redis publisher", error))?;
+        let connection =
+            RedisConnection::connect(&config.deployment, "connect redis publisher").await?;
         Ok(Self { connection, config })
     }
 
@@ -312,8 +641,7 @@ pub async fn redis_cluster_parts_from_config(
     })
 }
 
-// Build a Redis-backed RustWing runtime from core configuration 通过核心配置创建 Redis 版 RustWing 运行时
-// Build a Redis-backed RustWing runtime from one Redis URL 通过单个 Redis 地址创建 Redis 版 RustWing 运行时
+// Build a Redis-backed RustWing runtime from core configuration and one Redis URL 通过核心配置和单个 Redis 地址创建 Redis 版 RustWing 运行时
 pub async fn redis_rust_wing_from_config(
     config: RustWingConfig,
     redis_url: impl Into<String>,
@@ -327,7 +655,6 @@ pub async fn redis_rust_wing_from_config(
     .await
 }
 
-// Build a Redis-backed RustWing runtime from explicit Redis parts 通过显式 Redis 部件创建 RustWing 运行时
 // Build a Redis-backed RustWing runtime from explicit Redis parts 通过显式 Redis 部件创建 RustWing 运行时
 pub async fn redis_rust_wing_from_parts(
     mut config: RustWingConfig,
@@ -351,6 +678,7 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         // Store each session as one field under the user's route hash 每个会话作为用户路由 hash 的一个字段
         let key = self.key_for_user(&route.connection_type, &route.user_id);
         let session_key = self.key_for_session(&route.session_id);
+        let sessions_key = self.key_for_sessions();
         let nodes_key = self.key_for_nodes();
         let field = route.session_id.as_str().to_owned();
         let payload = serde_json::to_vec(&route)?;
@@ -361,6 +689,7 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
             .expire(&key, ttl_seconds(ttl))
             .set(&session_key, payload)
             .expire(&session_key, ttl_seconds(ttl))
+            .sadd(&sessions_key, route.session_id.as_str())
             .sadd(&nodes_key, route.node_id.as_str())
             .query_async::<()>(&mut connection)
             .await
@@ -378,10 +707,12 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         let mut connection = self.connection.clone();
         let key = self.key_for_user(connection_type, user_id);
         let session_key = self.key_for_session(session_id);
+        let sessions_key = self.key_for_sessions();
         redis::pipe()
             .atomic()
             .hdel(&key, session_id.as_str())
             .del(&session_key)
+            .srem(&sessions_key, session_id.as_str())
             .query_async::<()>(&mut connection)
             .await
             .map_err(|error| redis_error("remove redis presence route", error))
@@ -456,11 +787,16 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         // Clone the manager because Redis commands need a mutable connection 克隆连接管理器以满足命令的可变访问
         let mut connection = self.connection.clone();
         let key = self.key_for_session(session_id);
+        let sessions_key = self.key_for_sessions();
         let payload = connection
-            .get::<_, Option<Vec<u8>>>(key)
+            .get::<_, Option<Vec<u8>>>(&key)
             .await
             .map_err(|error| redis_error("locate redis presence session route", error))?;
         let Some(payload) = payload else {
+            connection
+                .srem::<_, _, ()>(sessions_key, session_id.as_str())
+                .await
+                .map_err(|error| redis_error("clean redis presence session index", error))?;
             return Ok(None);
         };
         let route: Route = serde_json::from_slice(&payload)?;
@@ -528,19 +864,20 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         if acquired.is_some() {
             return Ok(NodeLease::Acquired);
         }
-
-        let owner = connection
-            .get::<_, Option<String>>(&key)
-            .await
-            .map_err(|error| redis_error("read redis node lease", error))?;
-        if owner.as_deref() != Some(instance_id) {
-            return Ok(NodeLease::Conflict);
-        }
-        connection
-            .expire::<_, ()>(&key, ttl as i64)
+        let refreshed = redis::cmd("EVAL")
+            .arg(REDIS_COMPARE_AND_EXPIRE_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .arg(instance_id)
+            .arg(ttl)
+            .query_async::<i64>(&mut connection)
             .await
             .map_err(|error| redis_error("refresh redis node lease", error))?;
-        Ok(NodeLease::Refreshed)
+        if refreshed == 1 {
+            Ok(NodeLease::Refreshed)
+        } else {
+            Ok(NodeLease::Conflict)
+        }
     }
 
     // Remove one Redis node lease if still owned by the instance 当前实例仍持有时删除 Redis 节点租约
@@ -548,16 +885,14 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         // Clone the manager because Redis commands need a mutable connection 克隆连接管理器以满足命令的可变访问
         let mut connection = self.connection.clone();
         let key = self.key_for_node_lease(node_id);
-        let owner = connection
-            .get::<_, Option<String>>(&key)
+        redis::cmd("EVAL")
+            .arg(REDIS_COMPARE_AND_DELETE_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .arg(instance_id)
+            .query_async::<i64>(&mut connection)
             .await
-            .map_err(|error| redis_error("read redis node lease before remove", error))?;
-        if owner.as_deref() == Some(instance_id) {
-            connection
-                .del::<_, ()>(&key)
-                .await
-                .map_err(|error| redis_error("remove redis node lease", error))?;
-        }
+            .map_err(|error| redis_error("remove redis node lease", error))?;
         Ok(())
     }
 }
@@ -584,9 +919,8 @@ impl RedisNodeSubscriberAdapter {
     pub async fn connect(config: RedisPublisherConfig) -> Result<Self> {
         // Validate before creating the reusable client 创建可复用客户端前先校验配置
         config.validate()?;
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|error| redis_error("create redis subscriber client", error))?;
-        Ok(Self { client, config })
+        let source = RedisSubscriberSource::from_deployment(&config.deployment)?;
+        Ok(Self { source, config })
     }
 
     // Borrow the effective Redis subscriber configuration 借用当前 Redis 订阅配置
@@ -636,7 +970,12 @@ impl RedisNodeSubscriberAdapter {
                 break;
             }
             let result = self
-                .consume_node_channel_once(&channel, &wing, &mut stop_rx)
+                .consume_node_channel_once(
+                    &channel,
+                    &wing,
+                    &mut stop_rx,
+                    reconnect_attempt.saturating_add(1),
+                )
                 .await;
             if *stop_rx.borrow() {
                 break;
@@ -660,9 +999,10 @@ impl RedisNodeSubscriberAdapter {
         channel: &str,
         wing: &RustWing,
         stop_rx: &mut watch::Receiver<bool>,
+        reconnect_attempt: u32,
     ) -> Result<()> {
-        let mut pubsub = self
-            .client
+        let client = self.source.client_for_attempt(reconnect_attempt).await?;
+        let mut pubsub = client
             .get_async_pubsub()
             .await
             .map_err(|error| redis_error("connect redis subscriber", error))?;
@@ -749,6 +1089,54 @@ fn redis_error(action: &str, error: redis::RedisError) -> RustWingError {
     RustWingError::Cluster(format!("{action}: {error}"))
 }
 
+// Validate a non-empty list of Redis URLs 校验非空 Redis 地址列表
+fn validate_redis_urls(urls: &[String], name: &str) -> Result<()> {
+    if urls.is_empty() || urls.iter().any(|url| url.trim().is_empty()) {
+        return Err(RustWingError::InvalidConfig(format!(
+            "redis {name} cannot be empty"
+        )));
+    }
+    for url in urls {
+        redis::Client::open(url.as_str()).map_err(|error| {
+            RustWingError::InvalidConfig(format!("invalid redis {name} entry: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+// Build a Sentinel resolver with optional Redis master credentials 构建带可选 Redis 主节点凭据的 Sentinel 解析器
+fn build_sentinel_client(config: &RedisSentinelConfig) -> Result<SentinelClient> {
+    config.validate()?;
+    let mut redis_info = redis::RedisConnectionInfo::default().set_db(config.redis_database);
+    if let Some(username) = &config.redis_username {
+        redis_info = redis_info.set_username(username);
+    }
+    if let Some(password) = &config.redis_password {
+        redis_info = redis_info.set_password(password);
+    }
+    let node_info = SentinelNodeConnectionInfo::default().set_redis_connection_info(redis_info);
+    SentinelClient::build(
+        config.urls.clone(),
+        config.service_name.clone(),
+        Some(node_info),
+        SentinelServerType::Master,
+    )
+    .map_err(|error| redis_error("create redis sentinel client", error))
+}
+
+// Check whether Sentinel should resolve a fresh master 检查 Sentinel 是否需要重新解析主节点
+fn redis_error_requires_master_refresh(error: &redis::RedisError) -> bool {
+    error.is_connection_dropped() || redis_error_is_readonly(error)
+}
+
+// Check whether Redis rejected a write because the connection points to a replica 检查 Redis 是否因连接指向副本而拒绝写入
+fn redis_error_is_readonly(error: &redis::RedisError) -> bool {
+    matches!(
+        error.kind(),
+        redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly)
+    )
+}
+
 // Compute the capped Redis subscriber reconnect delay 计算带上限的 Redis 订阅重连退避
 fn redis_subscriber_reconnect_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(6);
@@ -784,8 +1172,8 @@ fn redis_presence_user_key(
     user_id: &UserId,
 ) -> String {
     format!(
-        "{}:presence:{}:{}",
-        key_prefix,
+        "{}:user:{}:{}",
+        redis_presence_namespace(key_prefix),
         connection_type.as_str(),
         user_id.as_str()
     )
@@ -793,17 +1181,35 @@ fn redis_presence_user_key(
 
 // Build the Redis key for one session route 构建单个会话路由的 Redis key
 fn redis_presence_session_key(key_prefix: &str, session_id: &SessionId) -> String {
-    format!("{}:presence:session:{}", key_prefix, session_id.as_str())
+    format!(
+        "{}:session:{}",
+        redis_presence_namespace(key_prefix),
+        session_id.as_str()
+    )
+}
+
+// Build the Redis set key for all known sessions 构建全部已知会话的 Redis 集合 key
+fn redis_presence_sessions_key(key_prefix: &str) -> String {
+    format!("{}:sessions", redis_presence_namespace(key_prefix))
 }
 
 // Build the Redis set key for route-owning nodes 构建拥有路由的节点集合 key
 fn redis_presence_nodes_key(key_prefix: &str) -> String {
-    format!("{key_prefix}:presence:nodes")
+    format!("{}:nodes", redis_presence_namespace(key_prefix))
 }
 
 // Build the Redis key for one node lease 构建单个节点租约的 Redis key
 fn redis_presence_node_lease_key(key_prefix: &str, node_id: &NodeId) -> String {
-    format!("{}:presence:node:{}", key_prefix, node_id.as_str())
+    format!(
+        "{}:node:{}",
+        redis_presence_namespace(key_prefix),
+        node_id.as_str()
+    )
+}
+
+// Build the versioned same-slot namespace for all presence keys 构建全部在线路由 key 共用的版本化同槽命名空间
+fn redis_presence_namespace(key_prefix: &str) -> String {
+    format!("{{{key_prefix}:presence}}:v2")
 }
 
 // Build the Redis channel for one node 构建单个节点的 Redis 频道
@@ -896,7 +1302,56 @@ mod tests {
         );
 
         assert_ne!(admin, game);
-        assert_eq!(admin, "rust-wing:presence:admin:alice");
+        assert_eq!(admin, "{rust-wing:presence}:v2:user:admin:alice");
+    }
+
+    // Every presence key uses the same Redis Cluster hash tag 全部在线路由 key 使用相同 Redis Cluster Hash Tag
+    #[test]
+    fn presence_keys_share_one_cluster_slot() {
+        let user = redis_presence_user_key(
+            "rust-wing",
+            &ConnectionType::from("default"),
+            &UserId::from("alice"),
+        );
+        let session = redis_presence_session_key("rust-wing", &SessionId::from("session-a"));
+        let sessions = redis_presence_sessions_key("rust-wing");
+        let nodes = redis_presence_nodes_key("rust-wing");
+        let lease = redis_presence_node_lease_key("rust-wing", &NodeId::from("node-a"));
+
+        for key in [user, session, sessions, nodes, lease] {
+            assert!(key.starts_with("{rust-wing:presence}:v2:"));
+        }
+    }
+
+    // Redis presence prefixes reject braces that could change the hash slot Redis 在线路由前缀拒绝会改变 Hash Slot 的花括号
+    #[test]
+    fn presence_config_rejects_hash_tag_braces() {
+        let config = RedisPresenceConfig::new("redis://127.0.0.1:6379").with_key_prefix("my-{app}");
+
+        assert!(config.validate().is_err());
+    }
+
+    // Redis Cluster configuration accepts multiple seed URLs Redis Cluster 配置接受多个种子地址
+    #[test]
+    fn cluster_config_accepts_multiple_seed_urls() {
+        let deployment = RedisDeployment::cluster(["redis://redis-1:6379", "redis://redis-2:6379"]);
+        let config = RedisPresenceConfig::from_deployment(deployment);
+
+        assert!(config.validate().is_ok());
+    }
+
+    // Redis Sentinel configuration keeps discovery and master settings Redis Sentinel 配置会保留发现与主节点设置
+    #[test]
+    fn sentinel_config_accepts_master_settings() {
+        let sentinel = RedisSentinelConfig::new(
+            ["redis://sentinel-1:26379", "redis://sentinel-2:26379"],
+            "mymaster",
+        )
+        .with_redis_credentials("default", "secret")
+        .with_redis_database(1);
+        let config = RedisPresenceConfig::from_deployment(RedisDeployment::sentinel(sentinel));
+
+        assert!(config.validate().is_ok());
     }
 
     // Redis node channels are scoped by node id Redis 节点频道会按节点标识隔离

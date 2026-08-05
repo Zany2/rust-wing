@@ -1,26 +1,24 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::watch;
 
-use crate::cluster::{Cluster, ClusterEnvelope, Route};
+use crate::cluster::Cluster;
 use crate::config::RustWingConfig;
 use crate::error::{Result, RustWingError};
-use crate::identity::{ConnectionType, Identity, MessageId, NodeId, SessionId, UserId};
-use crate::protocol::{AckStage, HeartbeatAckData};
-use crate::session::{AcceptedSession, Session, SessionSnapshot};
+use crate::identity::{Identity, UserId};
+use crate::protocol::HeartbeatAckData;
+use crate::session::{AcceptedSession, Session};
 
-mod ack;
 mod delivery;
 mod disconnect;
-mod lease;
 mod maintenance;
+mod presence;
+mod query;
 mod registry;
 mod stats;
 
-use ack::{AckForward, AckTracker};
-pub use ack::{AckSnapshot, SessionAckSnapshot};
-use lease::generate_instance_id;
+use presence::generate_instance_id;
 use registry::Registry;
 use stats::RuntimeStats;
 pub use stats::StatsSnapshot;
@@ -40,8 +38,6 @@ pub(super) struct Inner {
     cluster: Option<Cluster>,
     // Local session registry 本地会话注册表
     registry: Registry,
-    // In-memory acknowledgement tracker 内存确认追踪器
-    acks: AckTracker,
     // Runtime counters for lightweight observability 轻量可观测性使用的运行计数器
     stats: RuntimeStats,
     // Cursor used to shard maintenance scans 维护分片扫描使用的游标
@@ -80,7 +76,7 @@ impl DeliveryReport {
 impl RustWing {
     // Create a standalone manager 创建独立管理器
     pub fn new(config: RustWingConfig) -> Self {
-        let mut wing = Self::with_cluster_unchecked(config, None);
+        let mut wing = Self::assemble(config, None);
         wing.start_maintenance();
         wing
     }
@@ -90,7 +86,7 @@ impl RustWing {
         let config = config.normalized();
         config.validate()?;
         if !config.cluster.enabled {
-            let mut wing = Self::with_cluster_unchecked(config, None);
+            let mut wing = Self::assemble(config, None);
             wing.start_maintenance();
             return Ok(wing);
         }
@@ -100,14 +96,13 @@ impl RustWing {
         ))
     }
 
-    // Create a manager without validation or background tasks 创建不执行校验或后台任务的管理器
-    pub fn with_cluster_unchecked(config: RustWingConfig, cluster: Option<Cluster>) -> Self {
+    // Assemble a manager before checked startup 供校验式启动使用的管理器组装方法
+    fn assemble(config: RustWingConfig, cluster: Option<Cluster>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config: config.normalized(),
                 cluster,
                 registry: Registry::default(),
-                acks: AckTracker::default(),
                 stats: RuntimeStats::default(),
                 maintenance_cursor: AtomicUsize::new(0),
                 instance_id: generate_instance_id(),
@@ -124,7 +119,12 @@ impl RustWing {
     ) -> Result<Self> {
         let config = config.normalized();
         config.validate()?;
-        let mut wing = Self::with_cluster_unchecked(config, cluster);
+        if config.cluster.enabled && cluster.is_none() {
+            return Err(RustWingError::InvalidConfig(
+                "cluster.enabled requires cluster dependencies".into(),
+            ));
+        }
+        let mut wing = Self::assemble(config, cluster);
         wing.register_node_lease().await?;
         wing.start_node_lease_refresher();
         wing.start_maintenance();
@@ -241,293 +241,8 @@ impl RustWing {
         })
     }
 
-    // Remove sessions that exceeded the inactivity timeout 移除超过不活跃超时的会话
-    pub async fn reap_inactive_sessions(&self) -> Result<usize> {
-        let sessions = self.all_sessions();
-        let inactive = sessions
-            .into_iter()
-            .filter(|session| session.is_inactive(self.inner.config.heartbeat_timeout))
-            .collect::<Vec<_>>();
-        for session in &inactive {
-            self.unregister(session).await?;
-        }
-        Ok(inactive.len())
-    }
-
-    // Generate a new message id for acknowledgement tracking 生成用于确认追踪的新消息标识
-    pub fn next_message_id(&self) -> MessageId {
-        MessageId::generate(&self.inner.config.node_id)
-    }
-
-    // Record a client acknowledgement for one session 记录某个会话的客户端确认
-    pub async fn acknowledge(
-        &self,
-        session_id: &SessionId,
-        message_id: &MessageId,
-        stage: AckStage,
-        client_time: Option<i64>,
-    ) -> Result<bool> {
-        let update = self
-            .inner
-            .acks
-            .acknowledge(session_id, message_id, stage, client_time)?;
-        if let Some(forward) = update.forward {
-            self.forward_ack(forward).await?;
-        }
-        Ok(update.updated)
-    }
-
-    // Read the acknowledgement snapshot for one message 读取某条消息的确认快照
-    // Forward a remote acknowledgement to the origin node 向发起节点转发远程确认
-    async fn forward_ack(&self, forward: AckForward) -> Result<()> {
-        let Some(cluster) = &self.inner.cluster else {
-            return Ok(());
-        };
-        if !self.inner.config.cluster.enabled {
-            return Ok(());
-        }
-        if forward.node_id == self.inner.config.node_id {
-            return Ok(());
-        }
-
-        let result = cluster
-            .publisher
-            .publish(
-                &forward.node_id,
-                ClusterEnvelope::new_for_ack(
-                    forward.session_id,
-                    forward.message_id,
-                    forward.stage,
-                    forward.client_time,
-                ),
-            )
-            .await;
-        match result {
-            Ok(()) => {
-                self.inner.stats.record_cluster_publish_success();
-                Ok(())
-            }
-            Err(error) => {
-                self.inner.stats.record_cluster_publish_failed();
-                Err(error)
-            }
-        }
-    }
-
-    pub fn ack_snapshot(&self, message_id: &MessageId) -> Result<Option<AckSnapshot>> {
-        self.inner.acks.snapshot(message_id)
-    }
-
-    // Count currently tracked acknowledgement messages 统计当前被追踪的确认消息数量
-    pub fn ack_pending_count(&self) -> usize {
-        self.inner.acks.pending_count()
-    }
-
-    // Remove expired acknowledgement entries 移除过期确认条目
-    pub fn reap_expired_acks(&self) -> usize {
-        self.inner.acks.reap_expired()
-    }
-
-    // Wait until all known local targets reach the required acknowledgement stage 等待全部已知本地目标达到所需确认阶段
-    pub async fn wait_for_ack(
-        &self,
-        message_id: &MessageId,
-        stage: AckStage,
-        timeout: std::time::Duration,
-    ) -> Result<Option<AckSnapshot>> {
-        self.inner.acks.wait_for(message_id, stage, timeout).await
-    }
-
-    // Look up one session by id 按标识查找一个会话
-    pub fn get_session(&self, session_id: &SessionId) -> Result<Option<Session>> {
-        Ok(self
-            .inner
-            .registry
-            .by_session
-            .get(session_id)
-            .map(|session| session.value().clone()))
-    }
-
-    // List snapshots for one default-system user's sessions 列出默认连接体系中某个用户的会话快照
-    pub fn list_user_sessions(&self, user_id: &UserId) -> Result<Vec<SessionSnapshot>> {
-        self.list_user_sessions_in(&ConnectionType::default(), user_id)
-    }
-
-    // List snapshots for one user's sessions in one connection system 列出某个连接体系中某个用户的会话快照
-    pub fn list_user_sessions_in(
-        &self,
-        connection_type: &ConnectionType,
-        user_id: &UserId,
-    ) -> Result<Vec<SessionSnapshot>> {
-        Ok(self
-            .sessions_for_user(connection_type, user_id)
-            .into_iter()
-            .map(|session| session.snapshot())
-            .collect())
-    }
-
-    // List snapshots for all local sessions 列出全部本地会话快照
-    pub fn list_sessions(&self) -> Result<Vec<SessionSnapshot>> {
-        Ok(self
-            .all_sessions()
-            .into_iter()
-            .map(|session| session.snapshot())
-            .collect())
-    }
-
-    // List snapshots for all local sessions in one connection system 列出某个连接体系中的全部本地会话快照
-    pub fn list_sessions_in(
-        &self,
-        connection_type: &ConnectionType,
-    ) -> Result<Vec<SessionSnapshot>> {
-        Ok(self
-            .inner
-            .registry
-            .sessions_for_connection_type(connection_type)
-            .into_iter()
-            .map(|session| session.snapshot())
-            .collect())
-    }
-
-    // Count active local sessions 统计活跃本地会话
-    pub fn connection_count(&self) -> Result<usize> {
-        Ok(self.inner.registry.by_session.len())
-    }
-
-    // Capture a lightweight runtime statistics snapshot 捕获轻量运行统计快照
-    pub fn stats_snapshot(&self) -> Result<StatsSnapshot> {
-        let cluster_enabled = self.inner.cluster.is_some() && self.inner.config.cluster.enabled;
-        let local_connections = self.connection_count()?;
-        Ok(self.inner.stats.snapshot(
-            self.inner.config.node_id.clone(),
-            local_connections,
-            self.inner.registry.user_count(),
-            self.ack_pending_count(),
-            usize::from(cluster_enabled),
-            if cluster_enabled {
-                local_connections
-            } else {
-                0
-            },
-        ))
-    }
-
-    // Capture a detailed runtime statistics snapshot with live cluster visibility 捕获包含实时集群可见性的详细运行统计快照
-    pub async fn detailed_stats_snapshot(&self) -> Result<StatsSnapshot> {
-        let cluster_enabled = self.inner.cluster.is_some() && self.inner.config.cluster.enabled;
-        let local_connections = self.connection_count()?;
-        let cluster_nodes = if cluster_enabled {
-            self.list_cluster_nodes().await?.len()
-        } else {
-            0
-        };
-        let cluster_routes = if cluster_enabled {
-            self.list_all_cluster_routes().await?.len()
-        } else {
-            0
-        };
-        Ok(self.inner.stats.snapshot(
-            self.inner.config.node_id.clone(),
-            local_connections,
-            self.inner.registry.user_count(),
-            self.ack_pending_count(),
-            cluster_nodes,
-            cluster_routes,
-        ))
-    }
-
-    // List live nodes visible through the configured cluster store 列出配置的集群存储中可见的活跃节点
-    pub async fn list_cluster_nodes(&self) -> Result<Vec<NodeId>> {
-        let Some(cluster) = &self.inner.cluster else {
-            return Ok(Vec::new());
-        };
-        if !self.inner.config.cluster.enabled {
-            return Ok(Vec::new());
-        }
-        cluster.presence.list_nodes().await
-    }
-
-    // List live routes in one connection system through the cluster store 列出集群存储中某个连接体系的活跃路由
-    pub async fn list_cluster_routes(
-        &self,
-        connection_type: &ConnectionType,
-    ) -> Result<Vec<Route>> {
-        let Some(cluster) = &self.inner.cluster else {
-            return Ok(Vec::new());
-        };
-        if !self.inner.config.cluster.enabled {
-            return Ok(Vec::new());
-        }
-        cluster.presence.list_routes(connection_type).await
-    }
-
-    // List live routes across all connection systems through the cluster store 列出集群存储中全部连接体系的活跃路由
-    pub async fn list_all_cluster_routes(&self) -> Result<Vec<Route>> {
-        let Some(cluster) = &self.inner.cluster else {
-            return Ok(Vec::new());
-        };
-        if !self.inner.config.cluster.enabled {
-            return Ok(Vec::new());
-        }
-        cluster.presence.list_all_routes().await
-    }
-
     // Insert a session and return sessions displaced by policy 插入会话并返回被策略替换的会话
     fn insert_session(&self, session: Session) -> Vec<Session> {
         self.inner.registry.insert(session, &self.inner.config)
-    }
-
-    // Snapshot all local sessions for one user 获取某个用户的全部本地会话快照
-    fn sessions_for_user(
-        &self,
-        connection_type: &ConnectionType,
-        user_id: &UserId,
-    ) -> Vec<Session> {
-        self.inner
-            .registry
-            .sessions_for_user(connection_type, user_id)
-    }
-
-    // Snapshot all local sessions 获取全部本地会话快照
-    fn all_sessions(&self) -> Vec<Session> {
-        self.inner.registry.all_sessions()
-    }
-
-    // Snapshot the next maintenance scan window 获取下一批维护扫描窗口
-    fn next_maintenance_sessions(&self, limit: usize) -> Vec<Session> {
-        let total = self.inner.registry.by_session.len();
-        if total == 0 || limit == 0 {
-            return Vec::new();
-        }
-        let start = self
-            .inner
-            .maintenance_cursor
-            .fetch_add(limit, Ordering::Relaxed)
-            % total;
-        self.inner.registry.session_window(start, limit)
-    }
-
-    // Register a distributed route for one session 为一个会话注册分布式路由
-    async fn register_presence(&self, session: &Session) -> Result<()> {
-        let Some(cluster) = &self.inner.cluster else {
-            return Ok(());
-        };
-        if !self.inner.config.cluster.enabled {
-            return Ok(());
-        }
-
-        cluster
-            .presence
-            .register(
-                Route {
-                    user_id: session.user_id().clone(),
-                    connection_type: session.connection_type().clone(),
-                    client_id: session.client_id().cloned(),
-                    session_id: session.id().clone(),
-                    node_id: self.inner.config.node_id.clone(),
-                },
-                self.inner.config.cluster.route_ttl,
-            )
-            .await
     }
 }

@@ -8,16 +8,12 @@ use crate::identity::{ConnectionType, NodeId};
 // Environment variable used to override the node id 覆盖节点标识使用的环境变量
 pub const RUST_WING_NODE_ID_ENV: &str = "RUST_WING_NODE_ID";
 
-// Default local node identifier 默认本地节点标识
-const DEFAULT_NODE_ID: &str = "local";
 // Default heartbeat send interval 默认心跳发送间隔
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 // Default heartbeat timeout window 默认心跳超时时间
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 // Default outbound queue size 默认写队列容量
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
-// Default acknowledgement tracking lifetime 默认确认追踪生命周期
-const DEFAULT_ACK_TTL: Duration = Duration::from_secs(300);
 // Default cluster route lifetime 默认集群路由有效期
 const DEFAULT_ROUTE_TTL: Duration = Duration::from_secs(90);
 // Default cluster node lease lifetime 默认集群节点租约有效期
@@ -53,8 +49,6 @@ pub struct RustWingConfig {
     pub heartbeat_timeout: Duration,
     // Per-session outbound queue capacity 每个会话的写队列容量
     pub write_queue_capacity: usize,
-    // In-memory acknowledgement tracking lifetime 内存确认追踪生命周期
-    pub ack_ttl: Duration,
     // Default session coexistence policy 默认会话共存策略
     pub default_connection_policy: ConnectionPolicy,
     // Per-connection-system policy overrides 连接体系级策略覆盖
@@ -95,11 +89,10 @@ impl Default for RustWingConfig {
     // Build default runtime settings 构建默认运行配置
     fn default() -> Self {
         Self {
-            node_id: NodeId::from(DEFAULT_NODE_ID),
+            node_id: NodeId::generate(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
             write_queue_capacity: DEFAULT_WRITE_QUEUE_CAPACITY,
-            ack_ttl: DEFAULT_ACK_TTL,
             default_connection_policy: ConnectionPolicy::UniqueClient,
             connection_policies: HashMap::new(),
             maintenance: MaintenanceConfig::default(),
@@ -228,12 +221,6 @@ impl RustWingConfig {
         self
     }
 
-    // Set the acknowledgement tracking lifetime 设置确认追踪生命周期
-    pub fn with_ack_ttl(mut self, ack_ttl: Duration) -> Self {
-        self.ack_ttl = ack_ttl;
-        self
-    }
-
     // Replace the full maintenance configuration 替换完整维护配置
     pub fn with_maintenance(mut self, maintenance: MaintenanceConfig) -> Self {
         self.maintenance = maintenance;
@@ -340,11 +327,6 @@ impl RustWingConfig {
                 "write_queue_capacity cannot be zero".into(),
             ));
         }
-        if self.ack_ttl.is_zero() {
-            return Err(RustWingError::InvalidConfig(
-                "ack_ttl cannot be zero".into(),
-            ));
-        }
         if self.maintenance.enabled && self.maintenance.interval.is_zero() {
             return Err(RustWingError::InvalidConfig(
                 "maintenance interval cannot be zero".into(),
@@ -385,9 +367,9 @@ impl RustWingConfig {
 
     // Replace invalid zero or empty values with defaults 使用默认值替换无效配置
     pub fn normalized(mut self) -> Self {
-        // Ensure node routing always has an identifier 确保节点路由始终具备标识
+        // Generate a node identifier when the configured value is empty 配置值为空时生成节点标识
         if self.node_id.as_str().is_empty() {
-            self.node_id = NodeId::from(DEFAULT_NODE_ID);
+            self.node_id = NodeId::generate();
         }
         // Restore the heartbeat interval when disabled accidentally 当心跳间隔被意外置零时恢复默认值
         if self.heartbeat_interval.is_zero() {
@@ -400,10 +382,6 @@ impl RustWingConfig {
         // Keep every session queue usable 保持每个会话队列可用
         if self.write_queue_capacity == 0 {
             self.write_queue_capacity = DEFAULT_WRITE_QUEUE_CAPACITY;
-        }
-        // Keep acknowledgement tracking from expiring immediately 避免确认追踪立即过期
-        if self.ack_ttl.is_zero() {
-            self.ack_ttl = DEFAULT_ACK_TTL;
         }
         // Keep enabled maintenance from busy-looping 避免启用的维护任务忙循环
         if self.maintenance.interval.is_zero() {
@@ -445,6 +423,34 @@ fn node_id_from_env_value(value: Option<String>) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Default configurations receive distinct generated node ids 默认配置会获得不同的自动生成节点标识
+    #[test]
+    fn default_generates_distinct_node_ids() {
+        let first = RustWingConfig::default();
+        let second = RustWingConfig::default();
+
+        assert!(first.node_id.as_str().starts_with("node-"));
+        assert_eq!(first.node_id.as_str().len(), "node-".len() + 32);
+        assert_ne!(first.node_id, second.node_id);
+    }
+
+    // An explicit node id replaces the generated default 显式节点标识会覆盖自动生成的默认值
+    #[test]
+    fn node_id_builder_overrides_generated_default() {
+        let config = RustWingConfig::default().with_node_id("node-a");
+
+        assert_eq!(config.node_id, NodeId::from("node-a"));
+    }
+
+    // Normalization replaces an empty node id with a generated value 归一化会用自动生成值替换空节点标识
+    #[test]
+    fn normalized_generates_empty_node_id() {
+        let config = RustWingConfig::default().with_node_id("").normalized();
+
+        assert!(config.node_id.as_str().starts_with("node-"));
+        assert_eq!(config.node_id.as_str().len(), "node-".len() + 32);
+    }
 
     // Default heartbeat settings favor general application workloads 默认心跳配置偏向通用应用负载
     #[test]

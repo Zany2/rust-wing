@@ -223,39 +223,6 @@ RustWing replies with a `heartbeat_ack` message that includes the echoed client
 timestamp, server heartbeat timestamp, configured heartbeat interval, and
 configured timeout.
 
-## Acknowledgement
-
-Outbound frames can opt into in-memory acknowledgement tracking by carrying a
-`message_id`:
-
-```rust
-let message_id = wing.next_message_id();
-let frame = OutboundFrame::text("important").require_ack(message_id.clone());
-wing.send_to_user("alice", frame).await?;
-```
-
-Clients acknowledge delivery by sending:
-
-```json
-{
-  "type": "ack",
-  "event": "ack",
-  "data": {
-    "message_id": "node-a-1716000000000-1",
-    "stage": "client_received",
-    "client_time": 1716000000100
-  }
-}
-```
-
-The initial stages are `client_received` and `business_processed`. Use
-`ack_snapshot(message_id)` to inspect local acknowledgement state, or
-`wait_for_ack(message_id, stage, timeout)` to wait for all known local targets.
-Tracked acknowledgement entries expire after `ack_ttl`; call
-`reap_expired_acks()` or `ack_pending_count()` to keep the in-memory tracker
-trimmed. This is an in-memory foundation for receipts; durable replay and
-cross-node ACK aggregation are intentionally left for a later reliability layer.
-
 ## Connection Systems
 
 RustWing defaults to `ConnectionPolicy::UniqueClient`, which keeps one active
@@ -340,16 +307,11 @@ The router provides:
 - `POST /systems/{connection_type}/broadcast`
 - `POST /systems/{connection_type}/disconnect/user`
 - `POST /systems/{connection_type}/disconnect/client`
-- `GET /ack/{message_id}`
-- `POST /ack/wait`
 - `GET /stats`
 - `GET /cluster/nodes`
 - `GET /cluster/routes`
 - `GET /systems/{connection_type}/routes`
 
-Send request bodies may include `"require_ack": true` and an optional
-`"message_id"`. If `require_ack` is true and no id is provided, RustWing
-generates one and returns it in the response.
 External broker messages use the same target model and can also disconnect a
 user, a client slot, or an exact session with `disconnect_user`,
 `disconnect_client`, and `disconnect_session` targets.
@@ -362,17 +324,23 @@ presence store and publishes cross-node envelopes through a node publisher.
 For in-process tests or local experiments:
 
 ```rust
-use rust_wing_core::{ClusterConfig, RustWing, RustWingConfig};
+use rust_wing_core::cluster::NoopPublisher;
+use rust_wing_core::{
+    Cluster, ClusterConfig, MemoryPresenceStore, RustWing, RustWingConfig,
+};
 
 #[tokio::main]
 async fn main() -> rust_wing_core::Result<()> {
-    let wing = RustWing::from_config(RustWingConfig {
-        cluster: ClusterConfig {
-            enabled: true,
-            ..ClusterConfig::default()
+    let wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
         },
-        ..RustWingConfig::default()
-    })
+        Some(Cluster::new(MemoryPresenceStore::new(), NoopPublisher)),
+    )
     .await?;
 
     Ok(())
@@ -411,41 +379,89 @@ Use `rust_wing_from_adapters` when they come from different infrastructure, for
 example Redis for routes and Kafka/NATS/custom middleware for cluster messages:
 
 ```rust
-use rust_wing_adapter::{RedisPresenceAdapter, RedisPresenceConfig, rust_wing_from_adapters};
+use rust_wing_adapter::{
+    NatsNodePublisherAdapter, NatsNodeSubscriberAdapter, NatsPublisherConfig,
+    RedisPresenceAdapter, RedisPresenceConfig, rust_wing_from_adapters,
+};
 use rust_wing_core::RustWingConfig;
 
 # async fn build() -> rust_wing_core::Result<()> {
 let presence = RedisPresenceAdapter::connect(
     RedisPresenceConfig::new("redis://127.0.0.1:6379")
 ).await?;
+let nats = NatsPublisherConfig::from_urls([
+    "nats://nats-1:4222",
+    "nats://nats-2:4222",
+]);
+let publisher = NatsNodePublisherAdapter::connect(nats.clone()).await?;
+let subscriber = NatsNodeSubscriberAdapter::connect(nats).await?;
 
-let publisher = build_kafka_or_nats_node_publisher().await?;
 let wing = rust_wing_from_adapters(
     RustWingConfig::default().with_node_id("node-a"),
     presence,
     publisher,
 ).await?;
-# let _ = wing;
+let subscriber = subscriber.spawn_current_node(wing.clone());
+
+// On graceful shutdown:
+subscriber.shutdown().await?;
+wing.shutdown().await?;
 # Ok(())
 # }
-# async fn build_kafka_or_nats_node_publisher() -> rust_wing_core::Result<impl rust_wing_adapter::NodePublisherAdapter> {
-#     struct DemoPublisher;
-#     #[async_trait::async_trait]
-#     impl rust_wing_adapter::NodePublisherAdapter for DemoPublisher {
-#         async fn publish(&self, _node_id: &rust_wing_core::NodeId, _envelope: rust_wing_core::ClusterEnvelope) -> rust_wing_core::Result<()> { Ok(()) }
-#     }
-#     Ok(DemoPublisher)
-# }
 ```
+
+Enable the `redis` and `nats` features for this composition. Kafka offers the
+same `KafkaNodePublisherAdapter` / `KafkaNodeSubscriberAdapter` split on
+non-Windows targets. Kafka uses one topic and consumer group per `NodeId`; the
+broker must allow automatic topic creation or the node topics must be created
+before startup. Kafka-backed nodes must use `NodeId` values containing only
+ASCII letters, digits, `.`, `_`, or `-`; generated node ids already satisfy
+this requirement.
 
 If an application needs separate Redis key prefixes, channel prefixes, or manual
 subscriber lifecycle control, it can still use
 `redis_cluster_parts_from_config(...)` to assemble the cluster and subscriber
 explicitly.
 
-For distributed deployments, every running instance needs a unique `node_id`.
-Set it explicitly with `with_node_id(...)`, or use `RustWingConfig::from_env()`
-to read `RUST_WING_NODE_ID`:
+Redis presence and Redis node messaging support standalone, Cluster, and
+Sentinel deployments through `RedisDeployment`:
+
+```rust
+use rust_wing_adapter::{
+    RedisDeployment, RedisPresenceConfig, RedisPublisherConfig,
+    RedisSentinelConfig,
+};
+
+let cluster = RedisDeployment::cluster([
+    "redis://redis-1:6379",
+    "redis://redis-2:6379",
+    "redis://redis-3:6379",
+]);
+let cluster_presence = RedisPresenceConfig::from_deployment(cluster.clone());
+let cluster_publisher = RedisPublisherConfig::from_deployment(cluster);
+
+let sentinel = RedisDeployment::sentinel(
+    RedisSentinelConfig::new(
+        ["redis://sentinel-1:26379", "redis://sentinel-2:26379"],
+        "mymaster",
+    )
+    .with_redis_credentials("default", "password"),
+);
+let sentinel_presence = RedisPresenceConfig::from_deployment(sentinel.clone());
+let sentinel_publisher = RedisPublisherConfig::from_deployment(sentinel);
+# let _ = (cluster_presence, cluster_publisher, sentinel_presence, sentinel_publisher);
+```
+
+All v2 presence keys share one Redis Cluster hash slot so multi-key route
+updates remain atomic. The session index replaces cluster-wide `SCAN`; this
+prioritizes correctness and failover over sharding presence data across slots.
+The v2 key layout is not readable by older RustWing versions, so all nodes in
+one cluster should be upgraded together.
+
+Every `RustWingConfig::default()` generates a `node-<UUID v7>` identifier. Set
+`node_id` explicitly with `with_node_id(...)` when a stable, readable value is
+needed, or use `RustWingConfig::from_env()` to let `RUST_WING_NODE_ID` override
+the generated value:
 
 ```rust
 let wing = RustWing::new(RustWingConfig::from_env());
@@ -459,13 +475,14 @@ Recommended values:
 | Docker Compose | Container hostname or container name. |
 | Bare metal | `hostname:port`, so multiple instances on one host stay distinct. |
 | Cloud VM | Instance id plus port when available. |
-| Local development | The default `local` is fine. |
+| Local development | Use the generated default unless a stable name is useful. |
 
-Use `RustWing::with_cluster_checked(...)` or `RustWing::from_config(...)` for
-clustered startup. These constructors register and refresh a short-lived node
-lease, and return an error when the same `node_id` is already owned by another
-live instance. Broadcast routing only uses nodes with an active lease, so stale
-node records do not receive new cluster envelopes.
+Use `RustWing::with_cluster_checked(...)` or an adapter-managed runtime for
+clustered startup. Cluster startup always registers and refreshes a short-lived
+node lease, whether the `node_id` was generated or configured, and returns an
+error when the same value is already owned by another live instance. Broadcast
+routing only uses nodes with an active lease, so stale node records do not
+receive new cluster envelopes.
 
 Call `shutdown().await` during graceful service shutdown to unregister local
 sessions and release the node lease:
@@ -478,11 +495,10 @@ let closed = wing.shutdown().await?;
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `node_id` | `local` or `RUST_WING_NODE_ID` via `from_env()` | Identifies the current server node. |
+| `node_id` | Generated `node-<UUID v7>`, or `RUST_WING_NODE_ID` via `from_env()` | Identifies the current server node. |
 | `heartbeat_interval` | `30s` | Heartbeat interval reported to clients. |
 | `heartbeat_timeout` | `90s` | Inactivity window before a session can be reaped. |
 | `write_queue_capacity` | `64` | Bounded outbound queue size per session. |
-| `ack_ttl` | `300s` | In-memory lifetime for acknowledgement tracking entries. |
 | `default_connection_policy` | `UniqueClient` | Controls how sessions coexist when a connection system has no override. |
 | `connection_policies` | empty | Overrides the policy for specific connection systems. |
 | `cluster.enabled` | `false` | Enables presence registration and remote routing when adapter dependencies are injected. |
@@ -502,10 +518,12 @@ cargo check --workspace
 cargo test
 ```
 
-Run feature-specific tests when working on Redis code:
+Run feature-specific tests when working on infrastructure adapters:
 
 ```bash
 cargo test -p rust-wing-adapter --features redis
+cargo test -p rust-wing-adapter --features nats
+cargo test -p rust-wing-adapter --features kafka
 ```
 
 ## Contributing

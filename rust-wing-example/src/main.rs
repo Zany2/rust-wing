@@ -77,8 +77,6 @@ struct HealthResponse {
     connections: usize,
     // Unique local user count 当前本地去重用户数
     users: usize,
-    // Currently tracked acknowledgement message count 当前追踪中的确认消息数
-    ack_pending_messages: usize,
     // Cluster nodes visible in the lightweight snapshot 轻量快照中可见的集群节点数
     cluster_nodes: usize,
     // Cluster routes visible in the lightweight snapshot 轻量快照中可见的集群路由数
@@ -194,10 +192,6 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse<HealthRespons
             users: stats
                 .as_ref()
                 .map(|stats| stats.local_users)
-                .unwrap_or_default(),
-            ack_pending_messages: stats
-                .as_ref()
-                .map(|stats| stats.ack_pending_messages)
                 .unwrap_or_default(),
             cluster_nodes: stats
                 .as_ref()

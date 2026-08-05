@@ -116,32 +116,42 @@ async fn main() -> rust_wing_core::Result<()> {
 保存，节点消息使用 Kafka、NATS 或业务自定义中间件发送：
 
 ```rust
-use rust_wing_adapter::{RedisPresenceAdapter, RedisPresenceConfig, rust_wing_from_adapters};
+use rust_wing_adapter::{
+    NatsNodePublisherAdapter, NatsNodeSubscriberAdapter, NatsPublisherConfig,
+    RedisPresenceAdapter, RedisPresenceConfig, rust_wing_from_adapters,
+};
 use rust_wing_core::RustWingConfig;
 
 # async fn build() -> rust_wing_core::Result<()> {
 let presence = RedisPresenceAdapter::connect(
     RedisPresenceConfig::new("redis://127.0.0.1:6379")
 ).await?;
+let nats = NatsPublisherConfig::from_urls([
+    "nats://nats-1:4222",
+    "nats://nats-2:4222",
+]);
+let publisher = NatsNodePublisherAdapter::connect(nats.clone()).await?;
+let subscriber = NatsNodeSubscriberAdapter::connect(nats).await?;
 
-let publisher = build_kafka_or_nats_node_publisher().await?;
 let wing = rust_wing_from_adapters(
     RustWingConfig::default().with_node_id("node-a"),
     presence,
     publisher,
 ).await?;
-# let _ = wing;
+let subscriber = subscriber.spawn_current_node(wing.clone());
+
+// 优雅关闭时：
+subscriber.shutdown().await?;
+wing.shutdown().await?;
 # Ok(())
 # }
-# async fn build_kafka_or_nats_node_publisher() -> rust_wing_core::Result<impl rust_wing_adapter::NodePublisherAdapter> {
-#     struct DemoPublisher;
-#     #[async_trait::async_trait]
-#     impl rust_wing_adapter::NodePublisherAdapter for DemoPublisher {
-#         async fn publish(&self, _node_id: &rust_wing_core::NodeId, _envelope: rust_wing_core::ClusterEnvelope) -> rust_wing_core::Result<()> { Ok(()) }
-#     }
-#     Ok(DemoPublisher)
-# }
 ```
+
+这种组合需要启用 `redis` 和 `nats` feature。非 Windows 目标也可以使用配套的
+`KafkaNodePublisherAdapter` 和 `KafkaNodeSubscriberAdapter`。Kafka 会为每个
+`NodeId` 使用独立 Topic 和消费组，因此 broker 必须允许自动创建 Topic，或者在
+节点启动前预先创建对应 Topic。使用 Kafka 的节点标识只能包含 ASCII 字母、数字、
+`.`、`_` 或 `-`；框架自动生成的 NodeId 已经满足这个要求。
 
 ## Axum 用法
 
@@ -242,37 +252,6 @@ Axum 集成会识别 JSON 文本帧形式的 RustWing 协议消息。客户端�
 RustWing 会回复 `heartbeat_ack` 消息，其中包含回显的客户端时间戳、服务端心跳时间戳、
 配置的心跳间隔和超时时间。
 
-## 消息确认
-
-出站帧可以通过携带 `message_id` 启用内存确认追踪：
-
-```rust
-let message_id = wing.next_message_id();
-let frame = OutboundFrame::text("important").require_ack(message_id.clone());
-wing.send_to_user("alice", frame).await?;
-```
-
-客户端通过如下消息确认投递：
-
-```json
-{
-  "type": "ack",
-  "event": "ack",
-  "data": {
-    "message_id": "node-a-1716000000000-1",
-    "stage": "client_received",
-    "client_time": 1716000000100
-  }
-}
-```
-
-当前阶段包括 `client_received` 和 `business_processed`。可以使用
-`ack_snapshot(message_id)` 查看本地确认状态，或使用
-`wait_for_ack(message_id, stage, timeout)` 等待全部已知本地目标达到指定确认阶段。
-确认追踪条目会在 `ack_ttl` 后过期；可以调用 `reap_expired_acks()` 或
-`ack_pending_count()` 清理内存追踪器。这是一层内存回执基础；持久化重投和跨节点
-ACK 聚合后续应放在可靠性层继续完善。
-
 ## 连接体系
 
 RustWing 默认使用 `ConnectionPolicy::UniqueClient`，即每个 `(user_id, client_id)`
@@ -354,15 +333,11 @@ fn internal_router(wing: RustWing) -> axum::Router {
 - `POST /systems/{connection_type}/broadcast`
 - `POST /systems/{connection_type}/disconnect/user`
 - `POST /systems/{connection_type}/disconnect/client`
-- `GET /ack/{message_id}`
-- `POST /ack/wait`
 - `GET /stats`
 - `GET /cluster/nodes`
 - `GET /cluster/routes`
 - `GET /systems/{connection_type}/routes`
 
-发送请求体可以包含 `"require_ack": true` 和可选 `"message_id"`。如果
-`require_ack` 为 true 且没有传入 id，RustWing 会自动生成并在响应中返回。
 外部消息组件使用同一套目标模型，也可以通过 `disconnect_user`、
 `disconnect_client`、`disconnect_session` 目标断开用户、客户端槽位或精确会话。
 
@@ -374,17 +349,23 @@ fn internal_router(wing: RustWing) -> axum::Router {
 用于进程内测试或本地实验时，可以使用内存后端：
 
 ```rust
-use rust_wing_core::{ClusterConfig, RustWing, RustWingConfig};
+use rust_wing_core::cluster::NoopPublisher;
+use rust_wing_core::{
+    Cluster, ClusterConfig, MemoryPresenceStore, RustWing, RustWingConfig,
+};
 
 #[tokio::main]
 async fn main() -> rust_wing_core::Result<()> {
-    let wing = RustWing::from_config(RustWingConfig {
-        cluster: ClusterConfig {
-            enabled: true,
-            ..ClusterConfig::default()
+    let wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
         },
-        ..RustWingConfig::default()
-    })
+        Some(Cluster::new(MemoryPresenceStore::new(), NoopPublisher)),
+    )
     .await?;
 
     Ok(())
@@ -420,9 +401,43 @@ async fn main() -> rust_wing_core::Result<()> {
 如果应用需要分别控制 Redis key 前缀、频道前缀或订阅任务，也可以继续使用
 `redis_cluster_parts_from_config(...)` 手动组装 cluster 和 subscriber。
 
-分布式部署时，每个运行实例都需要唯一的 `node_id`。可以通过
-`with_node_id(...)` 显式设置，也可以使用 `RustWingConfig::from_env()`
-读取 `RUST_WING_NODE_ID`：
+Redis Presence 和 Redis 节点消息都可以通过 `RedisDeployment` 使用单节点、Cluster
+或 Sentinel 部署：
+
+```rust
+use rust_wing_adapter::{
+    RedisDeployment, RedisPresenceConfig, RedisPublisherConfig,
+    RedisSentinelConfig,
+};
+
+let cluster = RedisDeployment::cluster([
+    "redis://redis-1:6379",
+    "redis://redis-2:6379",
+    "redis://redis-3:6379",
+]);
+let cluster_presence = RedisPresenceConfig::from_deployment(cluster.clone());
+let cluster_publisher = RedisPublisherConfig::from_deployment(cluster);
+
+let sentinel = RedisDeployment::sentinel(
+    RedisSentinelConfig::new(
+        ["redis://sentinel-1:26379", "redis://sentinel-2:26379"],
+        "mymaster",
+    )
+    .with_redis_credentials("default", "password"),
+);
+let sentinel_presence = RedisPresenceConfig::from_deployment(sentinel.clone());
+let sentinel_publisher = RedisPublisherConfig::from_deployment(sentinel);
+# let _ = (cluster_presence, cluster_publisher, sentinel_presence, sentinel_publisher);
+```
+
+v2 Presence Key 使用同一个 Redis Cluster Hash Slot，保证多 Key 路由更新仍然原子；
+Session 索引替代了跨节点 `SCAN`。这个方案优先保证正确性和故障转移，不会把
+Presence 数据分散到多个 Slot。旧版本无法读取 v2 Key，因此同一集群内的节点应当
+一起升级。
+
+每次调用 `RustWingConfig::default()` 都会生成一个 `node-<UUID v7>` 标识。
+需要稳定且易读的值时，可以通过 `with_node_id(...)` 显式设置；也可以使用
+`RustWingConfig::from_env()`，让 `RUST_WING_NODE_ID` 覆盖自动生成值：
 
 ```rust
 let wing = RustWing::new(RustWingConfig::from_env());
@@ -436,12 +451,12 @@ let wing = RustWing::new(RustWingConfig::from_env());
 | Docker Compose | 容器 hostname 或容器名。 |
 | 裸机部署 | `hostname:port`，避免同一机器多实例冲突。 |
 | 云服务器 | 优先使用 instance id 加端口。 |
-| 本地开发 | 默认 `local` 即可。 |
+| 本地开发 | 默认使用自动生成值，需要稳定名称时再显式设置。 |
 
-集群启动建议使用 `RustWing::with_cluster_checked(...)` 或
-`RustWing::from_config(...)`。这些构造方法会注册并持续刷新短期节点租约，
-如果同一个 `node_id` 已经被另一个活跃实例占用，会直接返回错误。广播路由只会使用
-仍持有有效租约的节点，因此旧节点记录不会继续接收新的集群信封。
+集群启动应使用 `RustWing::with_cluster_checked(...)` 或 adapter 提供的托管运行时。
+无论 `node_id` 是自动生成还是用户配置，集群启动都会注册并持续刷新短期节点租约；
+如果同一个值已经被另一个活跃实例占用，会直接返回错误。广播路由只会使用仍持有
+有效租约的节点，因此旧节点记录不会继续接收新的集群信封。
 
 服务优雅关闭时调用 `shutdown().await`，用于注销本地会话并释放节点租约：
 
@@ -453,11 +468,10 @@ let closed = wing.shutdown().await?;
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `node_id` | `local`，或通过 `from_env()` 读取 `RUST_WING_NODE_ID` | 标识当前服务节点。 |
+| `node_id` | 自动生成 `node-<UUID v7>`，或通过 `from_env()` 读取 `RUST_WING_NODE_ID` | 标识当前服务节点。 |
 | `heartbeat_interval` | `30s` | 返回给客户端的心跳间隔。 |
 | `heartbeat_timeout` | `90s` | 会话可被回收前允许的不活跃窗口。 |
 | `write_queue_capacity` | `64` | 每个会话的有界出站队列容量。 |
-| `ack_ttl` | `300s` | 确认追踪条目的内存保留时间。 |
 | `default_connection_policy` | `UniqueClient` | 控制没有体系级覆盖时的会话共存方式。 |
 | `connection_policies` | 空 | 覆盖特定连接体系的会话共存策略。 |
 | `cluster.enabled` | `false` | 在注入 adapter 集群依赖后启用在线状态注册和远程路由。 |
@@ -477,10 +491,12 @@ cargo check --workspace
 cargo test
 ```
 
-修改 Redis 相关代码时，可以运行 feature 相关测试：
+修改基础设施适配器时，可以运行对应 feature 测试：
 
 ```bash
 cargo test -p rust-wing-adapter --features redis
+cargo test -p rust-wing-adapter --features nats
+cargo test -p rust-wing-adapter --features kafka
 ```
 
 ## 贡献

@@ -19,7 +19,7 @@ async-nats = "0"
 axum = { version = "0.8", features = ["ws"] }
 dashmap = "6"
 futures-util = "0.3"
-redis = { version = "1.0.4", default-features = false, features = ["aio", "tokio-comp", "connection-manager"] }
+redis = { version = "1.0.4", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "cluster-async", "sentinel"] }
 rdkafka = "0"
 rust-wing-core = { path = "rust-wing-core" }
 serde = { version = "1", features = ["derive"] }

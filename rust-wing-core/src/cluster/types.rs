@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{ClientId, ConnectionType, MessageId, NodeId, SessionId, UserId};
-use crate::protocol::{AckStage, FrameKind, OutboundFrame};
+use crate::identity::{ClientId, ConnectionType, NodeId, SessionId, UserId};
+use crate::protocol::{FrameKind, OutboundFrame};
 
 // Cluster routing entry 集群路由条目
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,17 +60,6 @@ pub enum ClusterTarget {
     },
     // Target every session on the receiving node 定向到接收节点的全部会话
     BroadcastAll,
-    // Target the origin node acknowledgement tracker 定向到发起节点的确认追踪器
-    Ack {
-        // Acknowledging session identifier 确认所属的会话标识
-        session_id: SessionId,
-        // Acknowledged message identifier 已确认的消息标识
-        message_id: MessageId,
-        // Acknowledgement stage 确认阶段
-        stage: AckStage,
-        // Optional client-side acknowledgement time 可选客户端确认时间
-        client_time: Option<i64>,
-    },
 }
 
 // Cross-node frame envelope 跨节点帧信封
@@ -82,10 +71,6 @@ pub struct ClusterEnvelope {
     pub frame_kind: FrameKind,
     // Original frame payload 原始帧负载
     pub payload: Vec<u8>,
-    // Optional message id expected to be acknowledged 期望被确认的可选消息标识
-    pub message_id: Option<MessageId>,
-    // Origin node for acknowledgement forwarding 用于确认回传的发起节点
-    pub origin_node_id: Option<NodeId>,
 }
 
 impl ClusterEnvelope {
@@ -98,8 +83,6 @@ impl ClusterEnvelope {
             },
             frame_kind: frame.kind,
             payload: frame.payload,
-            message_id: frame.message_id,
-            origin_node_id: None,
         }
     }
 
@@ -118,8 +101,6 @@ impl ClusterEnvelope {
             },
             frame_kind: frame.kind,
             payload: frame.payload,
-            message_id: frame.message_id,
-            origin_node_id: None,
         }
     }
 
@@ -129,8 +110,6 @@ impl ClusterEnvelope {
             target: ClusterTarget::Session { session_id },
             frame_kind: frame.kind,
             payload: frame.payload,
-            message_id: frame.message_id,
-            origin_node_id: None,
         }
     }
 
@@ -140,8 +119,6 @@ impl ClusterEnvelope {
             target: ClusterTarget::Broadcast { connection_type },
             frame_kind: frame.kind,
             payload: frame.payload,
-            message_id: frame.message_id,
-            origin_node_id: None,
         }
     }
 
@@ -151,36 +128,7 @@ impl ClusterEnvelope {
             target: ClusterTarget::BroadcastAll,
             frame_kind: frame.kind,
             payload: frame.payload,
-            message_id: frame.message_id,
-            origin_node_id: None,
         }
-    }
-
-    // Convert a delivered acknowledgement into a cluster envelope 将投递确认转换为集群信封
-    pub fn new_for_ack(
-        session_id: SessionId,
-        message_id: MessageId,
-        stage: AckStage,
-        client_time: Option<i64>,
-    ) -> Self {
-        Self {
-            target: ClusterTarget::Ack {
-                session_id,
-                message_id: message_id.clone(),
-                stage,
-                client_time,
-            },
-            frame_kind: FrameKind::Text,
-            payload: Vec::new(),
-            message_id: Some(message_id),
-            origin_node_id: None,
-        }
-    }
-
-    // Attach the origin node for acknowledgement forwarding 附加用于确认回传的发起节点
-    pub fn with_origin_node(mut self, node_id: NodeId) -> Self {
-        self.origin_node_id = Some(node_id);
-        self
     }
 
     // Recover the original outbound frame 还原原始出站帧
@@ -188,7 +136,6 @@ impl ClusterEnvelope {
         OutboundFrame {
             kind: self.frame_kind,
             payload: self.payload,
-            message_id: self.message_id,
         }
     }
 }

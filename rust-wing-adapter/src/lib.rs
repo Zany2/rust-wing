@@ -19,7 +19,8 @@ pub mod redis;
 #[cfg(feature = "kafka")]
 pub use kafka::{
     KafkaExternalMessageConsumerConfig, KafkaExternalMessageConsumerHandle,
-    spawn_kafka_external_message_consumer,
+    KafkaNodePublisherAdapter, KafkaNodeSubscriberAdapter, KafkaNodeSubscriberHandle,
+    KafkaPublisherConfig, spawn_kafka_external_message_consumer,
 };
 pub use memory::MemoryPresenceAdapter;
 pub use messaging::{
@@ -29,16 +30,17 @@ pub use messaging::{
 };
 #[cfg(feature = "nats")]
 pub use nats::{
-    NatsExternalMessageConsumerConfig, NatsExternalMessageConsumerHandle,
+    NatsExternalMessageConsumerConfig, NatsExternalMessageConsumerHandle, NatsNodePublisherAdapter,
+    NatsNodeSubscriberAdapter, NatsNodeSubscriberHandle, NatsPublisherConfig,
     spawn_nats_external_message_consumer,
 };
 pub use presence::{PresenceStoreAdapter, PresenceStoreBridge};
 pub use publisher::{NodePublisherAdapter, NodePublisherBridge};
 #[cfg(feature = "redis")]
 pub use redis::{
-    RedisClusterParts, RedisNodePublisherAdapter, RedisNodeSubscriberAdapter,
+    RedisClusterParts, RedisDeployment, RedisNodePublisherAdapter, RedisNodeSubscriberAdapter,
     RedisNodeSubscriberHandle, RedisPresenceAdapter, RedisPresenceConfig, RedisPublisherConfig,
-    RedisRustWing, redis_cluster_from_config, redis_cluster_parts_from_config,
+    RedisRustWing, RedisSentinelConfig, redis_cluster_from_config, redis_cluster_parts_from_config,
     redis_rust_wing_from_config, redis_rust_wing_from_parts,
 };
 

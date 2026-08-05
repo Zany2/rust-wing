@@ -23,10 +23,9 @@ async fn external_user_message_delivers_to_default_user() {
 
 // External JSON messages can target exact sessions 外部 JSON 消息可以投递到精确会话
 #[tokio::test]
-async fn external_json_message_delivers_to_session_with_ack() {
+async fn external_json_message_delivers_to_session() {
     let wing = RustWing::new(RustWingConfig::default());
     let mut accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
     let payload = json!({
         "target": {
             "type": "session",
@@ -35,8 +34,7 @@ async fn external_json_message_delivers_to_session_with_ack() {
         "payload": {
             "kind": "text",
             "data": "session hello"
-        },
-        "message_id": message_id.as_str()
+        }
     });
     let message = external_message_from_json(payload.to_string()).unwrap();
 
@@ -45,8 +43,6 @@ async fn external_json_message_delivers_to_session_with_ack() {
 
     assert_eq!(report.local_sessions, 1);
     assert_eq!(frame.payload, b"session hello");
-    assert_eq!(frame.message_id.as_ref(), Some(&message_id));
-    assert_eq!(wing.ack_pending_count(), 1);
 }
 
 // External binary broadcast messages reach local sessions 外部二进制广播消息会到达本地会话

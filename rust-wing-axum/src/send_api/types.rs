@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rust_wing_core::{AckStage, RustWing};
+use rust_wing_core::RustWing;
 use serde::Deserialize;
 
 use crate::auth::AxumSendApiGuard;
@@ -21,10 +21,6 @@ pub struct SendToUserRequest {
     pub connection_type: Option<String>,
     pub user_id: String,
     pub message: String,
-    #[serde(default)]
-    pub require_ack: bool,
-    #[serde(default)]
-    pub message_id: Option<String>,
 }
 
 // Request body for sending to one client slot 向单个客户端槽位发送的请求体
@@ -36,10 +32,6 @@ pub struct SendToClientRequest {
     #[serde(default)]
     pub client_id: Option<String>,
     pub message: String,
-    #[serde(default)]
-    pub require_ack: bool,
-    #[serde(default)]
-    pub message_id: Option<String>,
 }
 
 // Request body for sending to one exact session 向精确会话发送的请求体
@@ -47,10 +39,6 @@ pub struct SendToClientRequest {
 pub struct SendToSessionRequest {
     pub session_id: String,
     pub message: String,
-    #[serde(default)]
-    pub require_ack: bool,
-    #[serde(default)]
-    pub message_id: Option<String>,
 }
 
 // Request body for broadcasting to one connection system 向单连接体系广播的请求体
@@ -59,10 +47,6 @@ pub struct BroadcastRequest {
     #[serde(default)]
     pub connection_type: Option<String>,
     pub message: String,
-    #[serde(default)]
-    pub require_ack: bool,
-    #[serde(default)]
-    pub message_id: Option<String>,
 }
 
 // Request body for disconnecting one user 断开单个用户的请求体
@@ -102,35 +86,4 @@ pub struct SendApiResponse {
     pub local_sessions: usize,
     pub remote_nodes: usize,
     pub remote_failures: usize,
-    pub message_id: Option<String>,
-}
-
-// Request body for waiting on acknowledgement 等待确认的请求体
-#[derive(Debug, Deserialize)]
-pub struct WaitForAckRequest {
-    pub message_id: String,
-    pub stage: AckStage,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-}
-
-// Response body for acknowledgement queries 确认查询响应体
-#[derive(Debug, serde::Serialize)]
-pub struct AckApiResponse {
-    pub message_id: String,
-    pub found: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required_stage: Option<AckStage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reached: Option<bool>,
-    pub sessions: Vec<AckSessionApiResponse>,
-}
-
-// Per-session acknowledgement response 单会话确认响应
-#[derive(Debug, serde::Serialize)]
-pub struct AckSessionApiResponse {
-    pub session_id: String,
-    pub stage: Option<AckStage>,
-    pub client_time: Option<i64>,
-    pub server_time: Option<i64>,
 }

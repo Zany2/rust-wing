@@ -3,10 +3,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_wing_core::{
-    AckStage, Cluster, ClusterConfig, ClusterEnvelope, ClusterTarget, ConnectionPolicy,
-    ConnectionType, FrameKind, Identity, MemoryPresenceStore, NodeId, NodeLease, NodePublisher,
-    OutboundFrame, PresenceStore, Result, Route, RustWing, RustWingConfig, RustWingError,
-    SessionId, UserId,
+    Cluster, ClusterConfig, ClusterEnvelope, ClusterTarget, ConnectionPolicy, ConnectionType,
+    FrameKind, Identity, MemoryPresenceStore, NodeId, NodeLease, NodePublisher, OutboundFrame,
+    PresenceStore, Result, Route, RustWing, RustWingConfig, RustWingError, SessionId, UserId,
 };
 
 // Default single-client policy replaces only the same client 默认单客户端策略仅替换同一客户端
@@ -241,6 +240,26 @@ async fn from_config_rejects_enabled_cluster_without_adapters() {
     ));
 }
 
+// Checked construction requires dependencies for an enabled cluster 校验式构造要求启用的集群具备依赖
+#[tokio::test]
+async fn checked_cluster_rejects_missing_dependencies() {
+    let config = RustWingConfig {
+        cluster: ClusterConfig {
+            enabled: true,
+            ..ClusterConfig::default()
+        },
+        ..RustWingConfig::default()
+    };
+
+    let result = RustWing::with_cluster_checked(config, None).await;
+
+    assert!(matches!(
+        result,
+        Err(RustWingError::InvalidConfig(message))
+            if message.contains("cluster.enabled requires cluster dependencies")
+    ));
+}
+
 // Checked cluster construction rejects duplicate live node ids 校验式集群构造会拒绝重复的活跃节点标识
 #[tokio::test]
 async fn checked_cluster_rejects_duplicate_node_id() {
@@ -264,6 +283,28 @@ async fn checked_cluster_rejects_duplicate_node_id() {
     assert!(matches!(
         second,
         Err(RustWingError::InvalidConfig(message)) if message.contains("node_id 'node-a' is already active")
+    ));
+}
+
+// Generated node ids receive the same duplicate lease protection 自动生成的节点标识同样受重复租约保护
+#[tokio::test]
+async fn checked_cluster_rejects_duplicate_generated_node_id() {
+    let presence = SharedPresenceStore::default();
+    let first_cluster = Cluster::new(presence.clone(), RecordingPublisher::default());
+    let second_cluster = Cluster::new(presence, RecordingPublisher::default());
+    let mut config = RustWingConfig::default();
+    config.cluster.enabled = true;
+    let node_id = config.node_id.clone();
+
+    let _first = RustWing::with_cluster_checked(config.clone(), Some(first_cluster))
+        .await
+        .unwrap();
+    let second = RustWing::with_cluster_checked(config, Some(second_cluster)).await;
+
+    assert!(matches!(
+        second,
+        Err(RustWingError::InvalidConfig(message))
+            if message.contains(&format!("node_id '{}' is already active", node_id.as_str()))
     ));
 }
 
@@ -366,7 +407,7 @@ async fn cluster_unique_client_accept_closes_matching_remote_session() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence.clone(), publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -376,7 +417,9 @@ async fn cluster_unique_client_accept_closes_matching_remote_session() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     let accepted = wing
         .accept(Identity::new("default", "alice").with_client("phone"))
@@ -441,7 +484,7 @@ async fn cluster_unique_user_accept_closes_all_remote_user_sessions() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence.clone(), publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             default_connection_policy: ConnectionPolicy::UniqueUser,
@@ -452,7 +495,9 @@ async fn cluster_unique_user_accept_closes_all_remote_user_sessions() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     let _accepted = wing
         .accept(Identity::new("default", "alice").with_client("tablet"))
@@ -514,7 +559,7 @@ async fn cluster_multi_session_accept_keeps_remote_session() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence.clone(), publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             default_connection_policy: ConnectionPolicy::MultiSession,
@@ -525,7 +570,9 @@ async fn cluster_multi_session_accept_keeps_remote_session() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     let _accepted = wing
         .accept(Identity::new("default", "alice").with_client("phone"))
@@ -717,7 +764,7 @@ async fn disconnect_session_publishes_to_remote_owner() {
         .unwrap();
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -727,7 +774,9 @@ async fn disconnect_session_publishes_to_remote_owner() {
             ..RustWingConfig::default()
         },
         Some(Cluster::new(presence.clone(), publisher)),
-    );
+    )
+    .await
+    .unwrap();
 
     let report = wing
         .disconnect_session(&SessionId::from("remote-session"), "kicked")
@@ -869,31 +918,25 @@ async fn stats_snapshot_reports_local_runtime_counts() {
     let wing = RustWing::new(
         RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::MultiSession),
     );
+    let node_id = wing.config().node_id.clone();
     let _first = wing.accept_user("alice").await.unwrap();
     let _second = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-
     let initial = wing.stats_snapshot().unwrap();
-    assert_eq!(initial.node_id, NodeId::from("local"));
+    assert_eq!(initial.node_id, node_id);
     assert_eq!(initial.local_connections, 2);
     assert_eq!(initial.local_users, 1);
-    assert_eq!(initial.ack_pending_messages, 0);
     assert_eq!(initial.cluster_nodes, 0);
     assert_eq!(initial.cluster_routes, 0);
     assert_eq!(initial.outbound_frames_enqueued_total, 0);
     assert_eq!(initial.outbound_frames_failed_total, 0);
 
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("tracked").require_ack(message_id),
-    )
-    .await
-    .unwrap();
+    wing.send_to_user("alice", OutboundFrame::text("tracked"))
+        .await
+        .unwrap();
     let snapshot = wing.stats_snapshot().unwrap();
 
     assert_eq!(snapshot.local_connections, 2);
     assert_eq!(snapshot.local_users, 1);
-    assert_eq!(snapshot.ack_pending_messages, 1);
     assert_eq!(snapshot.outbound_frames_enqueued_total, 2);
     assert_eq!(snapshot.outbound_frames_failed_total, 0);
 }
@@ -1080,7 +1123,7 @@ async fn send_to_session_publishes_to_remote_owner() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -1090,7 +1133,9 @@ async fn send_to_session_publishes_to_remote_owner() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     let report = wing
         .send_to_session(
@@ -1145,7 +1190,9 @@ async fn remote_route_publishes_to_target_node() {
         },
         ..RustWingConfig::default()
     };
-    let wing = RustWing::with_cluster_unchecked(config, Some(cluster));
+    let wing = RustWing::with_cluster_checked(config, Some(cluster))
+        .await
+        .unwrap();
 
     // Send a frame that must leave the current node 发送一帧必须离开当前节点的消息
     let report = wing
@@ -1198,7 +1245,7 @@ async fn send_to_client_publishes_only_matching_remote_client() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -1208,7 +1255,9 @@ async fn send_to_client_publishes_only_matching_remote_client() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     let report = wing
         .send_to_client("alice", Some("phone"), OutboundFrame::text("hello"))
@@ -1260,7 +1309,7 @@ async fn broadcast_publishes_to_remote_nodes() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             default_connection_policy: ConnectionPolicy::MultiSession,
@@ -1271,7 +1320,9 @@ async fn broadcast_publishes_to_remote_nodes() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
     let _local_default = wing
         .accept(Identity::new("default", "local"))
         .await
@@ -1322,7 +1373,7 @@ async fn broadcast_all_publishes_to_remote_nodes() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -1332,7 +1383,9 @@ async fn broadcast_all_publishes_to_remote_nodes() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
     let _default = wing
         .accept(Identity::new("default", "alice"))
         .await
@@ -1377,7 +1430,7 @@ async fn send_to_user_counts_local_sessions_and_remote_nodes() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             default_connection_policy: ConnectionPolicy::MultiSession,
@@ -1388,7 +1441,9 @@ async fn send_to_user_counts_local_sessions_and_remote_nodes() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
     let _local = wing
         .accept(Identity::new("default", "alice"))
         .await
@@ -1444,7 +1499,9 @@ async fn remote_routes_publish_once_per_node() {
         },
         ..RustWingConfig::default()
     };
-    let wing = RustWing::with_cluster_unchecked(config, Some(cluster));
+    let wing = RustWing::with_cluster_checked(config, Some(cluster))
+        .await
+        .unwrap();
 
     // Send one user message through the cluster 向集群发送一条用户消息
     let report = wing
@@ -1494,7 +1551,7 @@ async fn send_to_user_counts_remote_nodes() {
     let publisher = RecordingPublisher::default();
     let published = publisher.published.clone();
     let cluster = Cluster::new(presence, publisher);
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             node_id: NodeId::from("node-a"),
             cluster: ClusterConfig {
@@ -1504,7 +1561,9 @@ async fn send_to_user_counts_remote_nodes() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     // Send one frame and inspect remote routing counts 发送一帧并检查远程路由计数
     let report = wing
@@ -1524,7 +1583,7 @@ async fn send_to_user_counts_remote_nodes() {
 async fn accept_rolls_back_when_presence_registration_fails() {
     // Build a clustered manager whose presence store rejects registration 构建在线状态注册会失败的集群管理器
     let cluster = Cluster::new(FailingPresenceStore, RecordingPublisher::default());
-    let wing = RustWing::with_cluster_unchecked(
+    let wing = RustWing::with_cluster_checked(
         RustWingConfig {
             cluster: ClusterConfig {
                 enabled: true,
@@ -1533,7 +1592,9 @@ async fn accept_rolls_back_when_presence_registration_fails() {
             ..RustWingConfig::default()
         },
         Some(cluster),
-    );
+    )
+    .await
+    .unwrap();
 
     // Accepting the session must surface the registration error 接收会话必须返回注册错误
     let result = wing.accept(Identity::new("default", "alice")).await;
@@ -1577,266 +1638,6 @@ async fn heartbeat_updates_session_state() {
     assert_eq!(ack.last_heartbeat_time, snapshot.last_heartbeat_time);
     assert_eq!(ack.heartbeat_interval_ms, 5_000);
     assert_eq!(ack.heartbeat_timeout_ms, 20_000);
-}
-
-// Acknowledgement tracking records local targets and updates stages 确认追踪会记录本地目标并更新阶段
-#[tokio::test]
-async fn ack_tracking_records_and_updates_local_session() {
-    let wing = RustWing::new(RustWingConfig::default());
-    let accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-
-    let report = wing
-        .send_to_user(
-            "alice",
-            OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(report.local_sessions, 1);
-    let snapshot = wing.ack_snapshot(&message_id).unwrap().unwrap();
-    assert_eq!(snapshot.sessions.len(), 1);
-    assert_eq!(snapshot.sessions[0].stage, None);
-
-    let updated = wing
-        .acknowledge(
-            accepted.session.id(),
-            &message_id,
-            AckStage::ClientReceived,
-            Some(123),
-        )
-        .await
-        .unwrap();
-
-    assert!(updated);
-    let snapshot = wing.ack_snapshot(&message_id).unwrap().unwrap();
-    assert!(snapshot.reached(AckStage::ClientReceived));
-    assert_eq!(snapshot.sessions[0].client_time, Some(123));
-}
-
-// Distributed acknowledgement returns to the origin node 分布式确认会回传到发起节点
-#[tokio::test]
-async fn distributed_acknowledgement_returns_to_origin_node() {
-    let presence = SharedPresenceStore::default();
-    let origin_publisher = RecordingPublisher::default();
-    let origin_published = origin_publisher.published.clone();
-    let remote_publisher = RecordingPublisher::default();
-    let remote_published = remote_publisher.published.clone();
-    let origin = RustWing::with_cluster_unchecked(
-        RustWingConfig {
-            node_id: NodeId::from("node-a"),
-            cluster: ClusterConfig {
-                enabled: true,
-                ..ClusterConfig::default()
-            },
-            ..RustWingConfig::default()
-        },
-        Some(Cluster::new(presence.clone(), origin_publisher)),
-    );
-    let remote = RustWing::with_cluster_unchecked(
-        RustWingConfig {
-            node_id: NodeId::from("node-b"),
-            cluster: ClusterConfig {
-                enabled: true,
-                ..ClusterConfig::default()
-            },
-            ..RustWingConfig::default()
-        },
-        Some(Cluster::new(presence, remote_publisher)),
-    );
-    let accepted = remote.accept_user("alice").await.unwrap();
-    let message_id = origin.next_message_id();
-
-    let report = origin
-        .send_to_user(
-            "alice",
-            OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-        )
-        .await
-        .unwrap();
-    let outbound_envelope = origin_published.lock().unwrap()[0].1.clone();
-
-    assert_eq!(report.remote_nodes, 1);
-    assert_eq!(
-        origin
-            .ack_snapshot(&message_id)
-            .unwrap()
-            .unwrap()
-            .sessions
-            .len(),
-        1
-    );
-
-    remote.handle_cluster_envelope(outbound_envelope).unwrap();
-    let updated = remote
-        .acknowledge(
-            accepted.session.id(),
-            &message_id,
-            AckStage::ClientReceived,
-            Some(456),
-        )
-        .await
-        .unwrap();
-    let ack_envelope = remote_published.lock().unwrap()[0].1.clone();
-
-    assert!(updated);
-    assert!(matches!(ack_envelope.target, ClusterTarget::Ack { .. }));
-
-    let delivered = origin.handle_cluster_envelope(ack_envelope).unwrap();
-    let snapshot = origin.ack_snapshot(&message_id).unwrap().unwrap();
-
-    assert_eq!(delivered, 1);
-    assert!(snapshot.reached(AckStage::ClientReceived));
-    assert_eq!(snapshot.sessions[0].client_time, Some(456));
-}
-
-// Distributed broadcast acknowledgements return to the origin node 分布式广播确认会回传到发起节点
-#[tokio::test]
-async fn distributed_broadcast_acknowledgement_returns_to_origin_node() {
-    let presence = SharedPresenceStore::default();
-    presence
-        .register_node(
-            &NodeId::from("node-b"),
-            "instance-node-b",
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
-    let origin_publisher = RecordingPublisher::default();
-    let origin_published = origin_publisher.published.clone();
-    let remote_publisher = RecordingPublisher::default();
-    let remote_published = remote_publisher.published.clone();
-    let origin = RustWing::with_cluster_unchecked(
-        RustWingConfig {
-            node_id: NodeId::from("node-a"),
-            cluster: ClusterConfig {
-                enabled: true,
-                ..ClusterConfig::default()
-            },
-            ..RustWingConfig::default()
-        },
-        Some(Cluster::new(presence.clone(), origin_publisher)),
-    );
-    let remote = RustWing::with_cluster_unchecked(
-        RustWingConfig {
-            node_id: NodeId::from("node-b"),
-            cluster: ClusterConfig {
-                enabled: true,
-                ..ClusterConfig::default()
-            },
-            ..RustWingConfig::default()
-        },
-        Some(Cluster::new(presence, remote_publisher)),
-    );
-    let accepted = remote.accept_user("alice").await.unwrap();
-    let message_id = origin.next_message_id();
-
-    let report = origin
-        .broadcast(OutboundFrame::text("needs ack").require_ack(message_id.clone()))
-        .await
-        .unwrap();
-    let outbound_envelope = origin_published.lock().unwrap()[0].1.clone();
-
-    assert_eq!(report.remote_nodes, 1);
-    assert_eq!(
-        origin
-            .ack_snapshot(&message_id)
-            .unwrap()
-            .unwrap()
-            .sessions
-            .len(),
-        1
-    );
-
-    remote.handle_cluster_envelope(outbound_envelope).unwrap();
-    let updated = remote
-        .acknowledge(
-            accepted.session.id(),
-            &message_id,
-            AckStage::ClientReceived,
-            Some(789),
-        )
-        .await
-        .unwrap();
-    let ack_envelope = remote_published.lock().unwrap()[0].1.clone();
-
-    assert!(updated);
-    assert!(matches!(ack_envelope.target, ClusterTarget::Ack { .. }));
-
-    let delivered = origin.handle_cluster_envelope(ack_envelope).unwrap();
-    let snapshot = origin.ack_snapshot(&message_id).unwrap().unwrap();
-
-    assert_eq!(delivered, 1);
-    assert!(snapshot.reached(AckStage::ClientReceived));
-    assert_eq!(snapshot.sessions[0].client_time, Some(789));
-}
-
-// Acknowledgement wait returns once the target stage is reached 确认等待会在目标阶段达到后返回
-#[tokio::test]
-async fn wait_for_ack_returns_when_stage_is_reached() {
-    let wing = RustWing::new(RustWingConfig::default());
-    let accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-    )
-    .await
-    .unwrap();
-
-    let ack_wing = wing.clone();
-    let ack_session_id = accepted.session.id().clone();
-    let ack_message_id = message_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        ack_wing
-            .acknowledge(
-                &ack_session_id,
-                &ack_message_id,
-                AckStage::ClientReceived,
-                None,
-            )
-            .await
-            .unwrap();
-    });
-
-    let snapshot = wing
-        .wait_for_ack(
-            &message_id,
-            AckStage::ClientReceived,
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert!(snapshot.reached(AckStage::ClientReceived));
-}
-
-// Expired acknowledgement entries can be reaped 过期确认条目可以被清理
-#[tokio::test]
-async fn expired_acks_are_reaped() {
-    let wing = RustWing::new(
-        RustWingConfig::default()
-            .with_ack_ttl(std::time::Duration::from_millis(10))
-            .with_maintenance_enabled(false),
-    );
-    let _accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(wing.ack_pending_count(), 1);
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-    assert_eq!(wing.reap_expired_acks(), 1);
-    assert_eq!(wing.ack_pending_count(), 0);
-    assert!(wing.ack_snapshot(&message_id).unwrap().is_none());
 }
 
 // Inactive sessions can be reaped by the manager 管理器可以回收不活跃会话
@@ -2022,29 +1823,6 @@ async fn managed_maintenance_limits_cleanup_per_tick() {
 
     let count = wait_for_connection_count_at_most(&wing, 1, Duration::from_millis(500)).await;
     assert_eq!(count, 1);
-}
-
-// Managed maintenance reaps expired acknowledgement entries automatically 托管维护会自动回收过期确认条目
-#[tokio::test]
-async fn managed_maintenance_reaps_expired_acks() {
-    let config = RustWingConfig::default()
-        .with_ack_ttl(Duration::from_millis(10))
-        .with_maintenance_interval(Duration::from_millis(5));
-    let wing = RustWing::from_config(config).await.unwrap();
-    let _accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(wing.ack_pending_count(), 1);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-
-    assert_eq!(wing.ack_pending_count(), 0);
 }
 
 // Wait until the local connection count reaches an upper bound 等待本地连接数达到指定上限

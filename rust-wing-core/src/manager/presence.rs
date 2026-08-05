@@ -1,15 +1,41 @@
+// Cluster presence and node lease lifecycle 集群在线状态与节点租约生命周期
 use std::sync::{Arc, Weak};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::cluster::NodeLease;
+use crate::cluster::{NodeLease, Route};
 use crate::error::{Result, RustWingError};
 use crate::identity::uuid_v7_simple;
+use crate::session::Session;
 
 use super::{Inner, RustWing};
 
 impl RustWing {
+    // Register a distributed route for one session 为一个会话注册分布式路由
+    pub(super) async fn register_presence(&self, session: &Session) -> Result<()> {
+        let Some(cluster) = &self.inner.cluster else {
+            return Ok(());
+        };
+        if !self.inner.config.cluster.enabled {
+            return Ok(());
+        }
+
+        cluster
+            .presence
+            .register(
+                Route {
+                    user_id: session.user_id().clone(),
+                    connection_type: session.connection_type().clone(),
+                    client_id: session.client_id().cloned(),
+                    session_id: session.id().clone(),
+                    node_id: self.inner.config.node_id.clone(),
+                },
+                self.inner.config.cluster.route_ttl,
+            )
+            .await
+    }
+
     // Register this runtime instance as the owner of its node id 注册当前运行实例为节点标识持有者
     pub(super) async fn register_node_lease(&self) -> Result<()> {
         let Some(cluster) = &self.inner.cluster else {
@@ -68,7 +94,7 @@ impl RustWing {
     }
 
     // Refresh the distributed route for one session 刷新一个会话的分布式路由
-    pub(super) async fn touch_presence(&self, session: &crate::session::Session) -> Result<()> {
+    pub(super) async fn touch_presence(&self, session: &Session) -> Result<()> {
         // Stop when no cluster integration exists 不存在集群集成时直接结束
         let Some(cluster) = &self.inner.cluster else {
             return Ok(());

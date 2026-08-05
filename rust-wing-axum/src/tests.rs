@@ -2,8 +2,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request};
 use rust_wing_core::cluster::NoopPublisher;
 use rust_wing_core::{
-    AckStage, Cluster, ClusterConfig, ConnectionPolicy, FrameKind, MemoryPresenceStore,
-    RustWingConfig,
+    Cluster, ClusterConfig, ConnectionPolicy, FrameKind, MemoryPresenceStore, RustWingConfig,
 };
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -43,7 +42,6 @@ fn heartbeat_time_prefers_data_payload() {
         message_type: MessageType::Heartbeat,
         event: Some(HEARTBEAT_EVENT.into()),
         request_id: None,
-        message_id: None,
         trace_id: None,
         seq: None,
         client_time: Some(1),
@@ -54,6 +52,47 @@ fn heartbeat_time_prefers_data_payload() {
     };
 
     assert_eq!(heartbeat_client_time(&message), Some(42));
+}
+
+// Heartbeat messages still receive built-in acknowledgements 心跳消息仍会收到内置确认响应
+#[tokio::test]
+async fn heartbeat_message_returns_ack_frame() {
+    let wing = RustWing::new(RustWingConfig::default());
+    let mut accepted = wing.accept_user("alice").await.unwrap();
+    let context = AxumMessageContext {
+        wing,
+        session: accepted.session.clone(),
+    };
+    let heartbeat = WsMessage {
+        version: 1,
+        message_type: MessageType::Heartbeat,
+        event: Some(HEARTBEAT_EVENT.into()),
+        request_id: Some("request-1".into()),
+        trace_id: None,
+        seq: None,
+        client_time: Some(42),
+        code: None,
+        message: None,
+        server_time: None,
+        data: None,
+    };
+
+    let handled = handle_text_message(
+        context,
+        &NoopAxumMessageHandler,
+        serde_json::to_string(&heartbeat).unwrap(),
+    )
+    .await
+    .unwrap();
+    let frame = accepted.outbound.recv().await.unwrap();
+    let ack: WsMessage = serde_json::from_slice(&frame.payload).unwrap();
+
+    assert!(handled);
+    assert_eq!(frame.kind, FrameKind::Text);
+    assert_eq!(ack.message_type, MessageType::HeartbeatAck);
+    assert_eq!(ack.event.as_deref(), Some(HEARTBEAT_EVENT));
+    assert_eq!(ack.request_id.as_deref(), Some("request-1"));
+    assert_eq!(ack.data.unwrap()["client_heartbeat_time"], 42);
 }
 
 // Auth context exposes the raw query string 认证上下文会暴露原始查询字符串
@@ -279,112 +318,31 @@ async fn disconnect_api_system_path_targets_connection_type() {
     );
 }
 
-// ACK API reports tracked acknowledgement snapshots ACK 接口会返回已追踪确认快照
-#[tokio::test]
-async fn ack_api_reports_tracked_snapshot() {
-    let wing = RustWing::new(RustWingConfig::default());
-    let _accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-    )
-    .await
-    .unwrap();
-    let app = send_api_router_unprotected(wing);
-
-    let response = app
-        .oneshot(get_request(&format!("/ack/{}", message_id.as_str())))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload = response_json(response).await;
-    assert_eq!(payload["message_id"], message_id.as_str());
-    assert_eq!(payload["found"], true);
-    assert_eq!(payload["sessions"].as_array().unwrap().len(), 1);
-    assert!(payload["sessions"][0]["stage"].is_null());
-}
-
-// ACK wait API returns after the requested stage is reached ACK 等待接口会在达到请求阶段后返回
-#[tokio::test]
-async fn ack_wait_api_returns_after_stage_is_reached() {
-    let wing = RustWing::new(RustWingConfig::default());
-    let accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-    )
-    .await
-    .unwrap();
-    let app = send_api_router_unprotected(wing.clone());
-    let ack_wing = wing.clone();
-    let ack_session_id = accepted.session.id().clone();
-    let ack_message_id = message_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        ack_wing
-            .acknowledge(
-                &ack_session_id,
-                &ack_message_id,
-                AckStage::ClientReceived,
-                Some(123),
-            )
-            .await
-            .unwrap();
-    });
-
-    let response = app
-        .oneshot(json_request(
-            "/ack/wait",
-            json!({
-                "message_id": message_id.as_str(),
-                "stage": "client_received",
-                "timeout_ms": 1000
-            }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload = response_json(response).await;
-    assert_eq!(payload["found"], true);
-    assert_eq!(payload["required_stage"], "client_received");
-    assert_eq!(payload["reached"], true);
-    assert_eq!(payload["sessions"][0]["stage"], "client_received");
-    assert_eq!(payload["sessions"][0]["client_time"], 123);
-}
-
 // Stats API reports local runtime counters 统计接口会返回本地运行计数
 #[tokio::test]
 async fn stats_api_reports_runtime_snapshot() {
     let wing = RustWing::new(
         RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::MultiSession),
     );
+    let node_id = wing.config().node_id.as_str().to_owned();
     let _first = wing.accept_user("alice").await.unwrap();
     let _second = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id),
-    )
-    .await
-    .unwrap();
+    wing.send_to_user("alice", OutboundFrame::text("stats"))
+        .await
+        .unwrap();
     let app = send_api_router_unprotected(wing);
 
     let response = app.oneshot(get_request("/stats")).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
-    assert_eq!(payload["node_id"], "local");
+    assert_eq!(payload["node_id"], node_id);
     assert_eq!(payload["local_connections"], 2);
     assert_eq!(payload["local_users"], 1);
-    assert_eq!(payload["ack_pending_messages"], 1);
     assert_eq!(payload["outbound_frames_enqueued_total"], 2);
 }
 
-// Client acknowledgement messages update the core acknowledgement tracker 客户端确认消息会更新核心确认追踪器
+// Cluster status API reports routes 集群状态接口会返回路由
 #[tokio::test]
 async fn cluster_status_api_reports_routes() {
     let cluster = Cluster::new(MemoryPresenceStore::new(), NoopPublisher);
@@ -443,55 +401,6 @@ async fn cluster_status_api_guard_can_reject_request() {
     let response = app.oneshot(get_request("/cluster/routes")).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-// Client acknowledgement data payloads update the core tracker 客户端确认数据负载会更新核心追踪器
-#[tokio::test]
-async fn ack_message_updates_tracker() {
-    let wing = RustWing::new(RustWingConfig::default());
-    let accepted = wing.accept_user("alice").await.unwrap();
-    let message_id = wing.next_message_id();
-    wing.send_to_user(
-        "alice",
-        OutboundFrame::text("needs ack").require_ack(message_id.clone()),
-    )
-    .await
-    .unwrap();
-    let context = AxumMessageContext {
-        wing: wing.clone(),
-        session: accepted.session.clone(),
-    };
-    let ack = WsMessage {
-        version: 1,
-        message_type: MessageType::Ack,
-        event: Some(ACK_EVENT.into()),
-        request_id: None,
-        message_id: None,
-        trace_id: None,
-        seq: None,
-        client_time: Some(321),
-        code: None,
-        message: None,
-        server_time: None,
-        data: Some(json!({
-            "message_id": message_id.as_str(),
-            "stage": "client_received",
-            "client_time": 123
-        })),
-    };
-
-    let handled = handle_text_message(
-        context,
-        &NoopAxumMessageHandler,
-        serde_json::to_string(&ack).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    assert!(handled);
-    let snapshot = wing.ack_snapshot(&message_id).unwrap().unwrap();
-    assert_eq!(snapshot.sessions[0].stage, Some(AckStage::ClientReceived));
-    assert_eq!(snapshot.sessions[0].client_time, Some(123));
 }
 
 // Sends a signal when dropped by task cancellation 任务取消触发丢弃时发送信号

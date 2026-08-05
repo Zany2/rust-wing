@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::error::Result;
 use crate::identity::NodeId;
+
+use super::RustWing;
 
 // Runtime counters shared by manager internals 管理器内部共享的运行计数器
 #[derive(Default)]
@@ -32,8 +35,6 @@ pub struct StatsSnapshot {
     pub local_connections: usize,
     // Unique local user count 当前本地去重用户数
     pub local_users: usize,
-    // Currently tracked acknowledgement message count 当前追踪中的确认消息数
-    pub ack_pending_messages: usize,
     // Live cluster nodes visible to the configured presence store 当前在线状态存储可见的集群节点数
     pub cluster_nodes: usize,
     // Live cluster routes visible to the configured presence store 当前在线状态存储可见的集群路由数
@@ -54,6 +55,48 @@ pub struct StatsSnapshot {
     pub disconnected_local_sessions_total: u64,
     // Remote nodes notified by explicit disconnect APIs 显式断开接口通知的远端节点总数
     pub disconnected_remote_nodes_total: u64,
+}
+
+impl RustWing {
+    // Capture a lightweight runtime statistics snapshot 捕获轻量运行统计快照
+    pub fn stats_snapshot(&self) -> Result<StatsSnapshot> {
+        let cluster_enabled = self.inner.cluster.is_some() && self.inner.config.cluster.enabled;
+        let local_connections = self.connection_count()?;
+        Ok(self.inner.stats.snapshot(
+            self.inner.config.node_id.clone(),
+            local_connections,
+            self.inner.registry.user_count(),
+            usize::from(cluster_enabled),
+            if cluster_enabled {
+                local_connections
+            } else {
+                0
+            },
+        ))
+    }
+
+    // Capture a detailed runtime statistics snapshot with live cluster visibility 捕获包含实时集群可见性的详细运行统计快照
+    pub async fn detailed_stats_snapshot(&self) -> Result<StatsSnapshot> {
+        let cluster_enabled = self.inner.cluster.is_some() && self.inner.config.cluster.enabled;
+        let local_connections = self.connection_count()?;
+        let cluster_nodes = if cluster_enabled {
+            self.list_cluster_nodes().await?.len()
+        } else {
+            0
+        };
+        let cluster_routes = if cluster_enabled {
+            self.list_all_cluster_routes().await?.len()
+        } else {
+            0
+        };
+        Ok(self.inner.stats.snapshot(
+            self.inner.config.node_id.clone(),
+            local_connections,
+            self.inner.registry.user_count(),
+            cluster_nodes,
+            cluster_routes,
+        ))
+    }
 }
 
 impl RuntimeStats {
@@ -107,7 +150,6 @@ impl RuntimeStats {
         node_id: NodeId,
         local_connections: usize,
         local_users: usize,
-        ack_pending_messages: usize,
         cluster_nodes: usize,
         cluster_routes: usize,
     ) -> StatsSnapshot {
@@ -115,7 +157,6 @@ impl RuntimeStats {
             node_id,
             local_connections,
             local_users,
-            ack_pending_messages,
             cluster_nodes,
             cluster_routes,
             outbound_frames_enqueued_total: self

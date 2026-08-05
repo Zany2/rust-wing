@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_wing_core::{ClientId, ConnectionType, MessageId, OutboundFrame, SessionId, UserId};
+use rust_wing_core::{ClientId, ConnectionType, OutboundFrame, SessionId, UserId};
 use serde::{Deserialize, Serialize};
 
 // External broker message target 外部消息目标
@@ -81,8 +81,6 @@ pub struct ExternalMessage {
     pub target: ExternalMessageTarget,
     #[serde(default)]
     pub payload: ExternalMessagePayload,
-    #[serde(default)]
-    pub message_id: Option<MessageId>,
 }
 
 // Shared consumer counters for external broker integrations 外部消息组件集成共享的消费计数器
@@ -241,7 +239,6 @@ impl ExternalMessage {
         Self {
             target,
             payload: ExternalMessagePayload::Text(payload.into()),
-            message_id: None,
         }
     }
 
@@ -250,24 +247,13 @@ impl ExternalMessage {
         Self {
             target,
             payload: ExternalMessagePayload::Binary(payload.into()),
-            message_id: None,
         }
     }
 
-    // Mark this message as requiring acknowledgement 标记该消息需要确认
-    pub fn require_ack(mut self, message_id: impl Into<MessageId>) -> Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
-
     pub(crate) fn into_frame(self) -> OutboundFrame {
-        let frame = match self.payload {
+        match self.payload {
             ExternalMessagePayload::Text(payload) => OutboundFrame::text(payload),
             ExternalMessagePayload::Binary(payload) => OutboundFrame::binary(payload),
-        };
-        match self.message_id {
-            Some(message_id) => frame.require_ack(message_id),
-            None => frame,
         }
     }
 }

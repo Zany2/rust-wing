@@ -11,12 +11,16 @@ flowchart TB
     Core["rust-wing-core<br/>connection, session, routing, protocol"]
     Adapter["rust-wing-adapter<br/>infrastructure bridges"]
     Redis["Redis<br/>optional backend"]
+    Nats["NATS<br/>optional node transport"]
+    Kafka["Kafka<br/>optional node transport"]
 
     App --> Axum
     App --> Core
     Axum --> Core
     Adapter --> Core
     Adapter -. redis feature .-> Redis
+    Adapter -. nats feature .-> Nats
+    Adapter -. kafka feature .-> Kafka
     Core -. cluster contracts .-> Adapter
 ```
 
@@ -29,7 +33,7 @@ flowchart LR
     Config["config.rs<br/>RustWingConfig / ConnectionPolicy / ClusterConfig"]
     Session["session.rs<br/>Session / AcceptedSession / SessionSnapshot"]
     Protocol["protocol.rs<br/>WsMessage / OutboundFrame / heartbeat payloads"]
-    Manager["manager.rs<br/>RustWing / Registry / DeliveryReport"]
+    Manager["manager.rs + manager/*<br/>RustWing / lifecycle / query / delivery"]
     Cluster["cluster.rs<br/>Route / ClusterEnvelope / PresenceStore / NodePublisher"]
     Error["error.rs<br/>RustWingError / Result"]
 
@@ -154,27 +158,6 @@ flowchart TB
     Remote --> LocalBroadcast
 ```
 
-## Acknowledgement Flow
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant Wing as RustWing
-    participant Session
-    participant Client
-    participant Tracker as AckTracker
-
-    App->>Wing: next_message_id()
-    App->>Wing: send_to_user(frame.require_ack(message_id))
-    Wing->>Session: enqueue(frame)
-    Wing->>Tracker: track(message_id, session_id)
-    Session-->>Client: WebSocket message
-    Client-->>Wing: {"type":"ack","data":{"message_id","stage"}}
-    Wing->>Tracker: acknowledge(session_id, message_id, stage)
-    App->>Wing: ack_snapshot / wait_for_ack
-    App->>Wing: reap_expired_acks / ack_pending_count
-```
-
 ## Shutdown Flow
 
 ```mermaid
@@ -209,16 +192,33 @@ flowchart LR
     RedisPresence["RedisPresenceAdapter"]
     RedisPublisher["RedisNodePublisherAdapter"]
     RedisSubscriber["RedisNodeSubscriberAdapter"]
-    RedisHandle["RedisNodeSubscriberHandle"]
+    NatsPublisher["NatsNodePublisherAdapter"]
+    NatsSubscriber["NatsNodeSubscriberAdapter"]
+    KafkaPublisher["KafkaNodePublisherAdapter"]
+    KafkaSubscriber["KafkaNodeSubscriberAdapter"]
+    CoreDelivery["RustWing::handle_cluster_envelope"]
 
     PresenceAdapter --> BridgePresence --> CorePresence
     PublisherAdapter --> BridgePublisher --> CorePublisher
     Memory --> PresenceAdapter
     RedisPresence --> PresenceAdapter
     RedisPublisher --> PublisherAdapter
-    RedisSubscriber --> RedisHandle
-    RedisSubscriber --> CorePublisher
+    NatsPublisher --> PublisherAdapter
+    KafkaPublisher --> PublisherAdapter
+    RedisSubscriber --> CoreDelivery
+    NatsSubscriber --> CoreDelivery
+    KafkaSubscriber --> CoreDelivery
 ```
+
+Presence and node transport are composed independently. Redis remains the
+shared production implementation for route storage and node leases. Node
+envelopes can be transported by Redis Pub/Sub, NATS subjects, or Kafka topics;
+each runtime must pair the publisher and subscriber from the same transport.
+Redis command adapters select standalone, Cluster, or Sentinel connections
+through `RedisDeployment`. Presence keys use one versioned hash tag so atomic
+pipelines remain valid in Redis Cluster, and a session set replaces global
+`SCAN`. NATS node and external consumers accept multiple bootstrap URLs and
+then use server discovery for reconnects.
 
 ## External Send API
 

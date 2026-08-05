@@ -5,8 +5,8 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use rust_wing_core::{
-    ACK_EVENT, AckData, FrameKind, HEARTBEAT_EVENT, HeartbeatData, Identity, MessageType,
-    OutboundFrame, Result, RustWing, Session, WsMessage, now_millis,
+    FrameKind, HEARTBEAT_EVENT, HeartbeatData, Identity, MessageType, OutboundFrame, Result,
+    RustWing, Session, WsMessage, now_millis,
 };
 use tokio::task::JoinHandle;
 
@@ -216,7 +216,6 @@ where
                 message_type: MessageType::HeartbeatAck,
                 event: Some(HEARTBEAT_EVENT.into()),
                 request_id: message.request_id,
-                message_id: None,
                 trace_id: message.trace_id,
                 seq: message.seq,
                 client_time: message.client_time,
@@ -226,21 +225,6 @@ where
                 data: Some(serde_json::to_value(ack)?),
             };
             context.session.enqueue(ack_message.to_text_frame()?)?;
-            return Ok(true);
-        }
-        if is_ack_message(&message) {
-            if let Some(ack) = ack_data(&message) {
-                context
-                    .wing
-                    .acknowledge(
-                        context.session.id(),
-                        &ack.message_id,
-                        ack.stage,
-                        ack.client_time.or(message.client_time),
-                    )
-                    .await?;
-            }
-            context.wing.touch(&context.session).await?;
             return Ok(true);
         }
     }
@@ -273,11 +257,6 @@ fn is_heartbeat_message(message: &WsMessage) -> bool {
         || message.event.as_deref() == Some(HEARTBEAT_EVENT)
 }
 
-// Detect whether a protocol message is an acknowledgement 判断协议消息是否为确认
-fn is_ack_message(message: &WsMessage) -> bool {
-    message.message_type == MessageType::Ack || message.event.as_deref() == Some(ACK_EVENT)
-}
-
 // Extract the client heartbeat timestamp from a message 从消息中提取客户端心跳时间
 pub(crate) fn heartbeat_client_time(message: &WsMessage) -> Option<i64> {
     message
@@ -286,12 +265,4 @@ pub(crate) fn heartbeat_client_time(message: &WsMessage) -> Option<i64> {
         .and_then(|data| serde_json::from_value::<HeartbeatData>(data).ok())
         .and_then(|data| data.client_time)
         .or(message.client_time)
-}
-
-// Extract acknowledgement data from a message 从消息中提取确认数据
-fn ack_data(message: &WsMessage) -> Option<AckData> {
-    message
-        .data
-        .clone()
-        .and_then(|data| serde_json::from_value::<AckData>(data).ok())
 }

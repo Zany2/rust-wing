@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use tokio::sync::watch;
@@ -31,7 +32,7 @@ impl RustWing {
     }
 }
 
-// Spawn a task that reaps stale sessions and expired acknowledgements 启动任务清理失活会话与过期确认
+// Spawn a task that reaps stale sessions 启动任务清理失活会话
 fn spawn_maintenance_task(
     inner: Weak<Inner>,
     mut stop_rx: watch::Receiver<bool>,
@@ -54,7 +55,6 @@ fn spawn_maintenance_task(
                     };
                     let wing = RustWing { inner };
                     let _ = wing.maintain_inactive_sessions().await;
-                    let _ = wing.reap_expired_acks();
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -67,6 +67,19 @@ fn spawn_maintenance_task(
 }
 
 impl RustWing {
+    // Remove sessions that exceeded the inactivity timeout 移除超过不活跃超时的会话
+    pub async fn reap_inactive_sessions(&self) -> Result<usize> {
+        let sessions = self.all_sessions();
+        let inactive = sessions
+            .into_iter()
+            .filter(|session| session.is_inactive(self.inner.config.heartbeat_timeout))
+            .collect::<Vec<_>>();
+        for session in &inactive {
+            self.unregister(session).await?;
+        }
+        Ok(inactive.len())
+    }
+
     // Probe inactive sessions before removing them 探测失活会话后再移除
     async fn maintain_inactive_sessions(&self) -> Result<usize> {
         let max_cleanup = self.inner.config.maintenance.max_cleanup_per_tick;
@@ -112,6 +125,20 @@ impl RustWing {
             self.inner.stats.record_maintenance_sessions_reaped(removed);
         }
         Ok(removed)
+    }
+
+    // Snapshot the next maintenance scan window 获取下一批维护扫描窗口
+    fn next_maintenance_sessions(&self, limit: usize) -> Vec<Session> {
+        let total = self.inner.registry.by_session.len();
+        if total == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let start = self
+            .inner
+            .maintenance_cursor
+            .fetch_add(limit, Ordering::Relaxed)
+            % total;
+        self.inner.registry.session_window(start, limit)
     }
 
     // Send one WebSocket ping as a liveness probe 发送一个 WebSocket Ping 作为存活探测
