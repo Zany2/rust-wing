@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::cluster::{ClusterEnvelope, ClusterTarget, Route};
-use crate::error::Result;
+use crate::error::{Result, RustWingError};
 use crate::identity::{ClientId, ConnectionType, SessionId, UserId};
+use crate::lifecycle::DisconnectCause;
 use crate::protocol::{FrameKind, OutboundFrame};
 use crate::session::Session;
 
@@ -66,7 +67,9 @@ impl RustWing {
         }
         let client_key =
             ClientRouteKey::new(connection_type.clone(), user_id.clone(), client_id.clone());
-        let sent = self.send_local_to_client_key(&client_key, frame.clone())?;
+        let sent = self
+            .send_local_to_client_key_async(&client_key, frame.clone())
+            .await?;
 
         let Some(cluster) = &self.inner.cluster else {
             return Ok(DeliveryReport {
@@ -119,7 +122,7 @@ impl RustWing {
             return self.disconnect_session(session_id, frame.payload).await;
         }
         if let Some(session) = self.get_session(session_id)? {
-            let sent = usize::from(self.enqueue(&session, frame).is_ok());
+            let sent = usize::from(self.enqueue_async(&session, frame).await.is_ok());
             return Ok(DeliveryReport {
                 local_sessions: sent,
                 remote_nodes: 0,
@@ -187,19 +190,67 @@ impl RustWing {
         Ok(sent)
     }
 
+    // Send a frame to one local client key and await failed-session cleanup 向本地客户端键发送一帧并等待失败会话清理
+    async fn send_local_to_client_key_async(
+        &self,
+        client_key: &ClientRouteKey,
+        frame: OutboundFrame,
+    ) -> Result<usize> {
+        let sessions = self.inner.registry.sessions_for_client_key(client_key);
+        Ok(self.enqueue_local_sessions_async(sessions, frame).await)
+    }
+
     // Queue one frame and update runtime counters 入队一帧并更新运行计数
     pub(super) fn enqueue(&self, session: &Session, frame: OutboundFrame) -> Result<()> {
         if frame.kind == FrameKind::Close {
-            session.close(frame.payload);
+            let cause = DisconnectCause::ServerRequested {
+                reason: String::from_utf8_lossy(&frame.payload).into_owned(),
+            };
+            self.remove_local_session_with_cause(session, cause);
             return Ok(());
         }
 
         if let Err(error) = session.enqueue(frame) {
             self.inner.stats.record_outbound_frame_failed();
+            let cause = enqueue_failure_cause(&error);
+            self.remove_local_session_with_cause(session, cause);
             return Err(error);
         }
         self.inner.stats.record_outbound_frame_enqueued();
         Ok(())
+    }
+
+    // Queue one frame and await complete cleanup when the session can no longer write 入队一帧并在会话无法继续写入时等待完整清理
+    async fn enqueue_async(&self, session: &Session, frame: OutboundFrame) -> Result<()> {
+        if frame.kind == FrameKind::Close {
+            let cause = close_frame_cause(&frame, None);
+            self.unregister_with_cause(session, cause).await?;
+            return Ok(());
+        }
+
+        if let Err(error) = session.enqueue(frame) {
+            self.inner.stats.record_outbound_frame_failed();
+            let cause = enqueue_failure_cause(&error);
+            self.unregister_with_cause(session, cause).await?;
+            return Err(error);
+        }
+        self.inner.stats.record_outbound_frame_enqueued();
+        Ok(())
+    }
+
+    // Queue one frame for local sessions and await failed-session cleanup 向本地会话入队一帧并等待失败会话清理
+    async fn enqueue_local_sessions_async(
+        &self,
+        sessions: Vec<Session>,
+        frame: OutboundFrame,
+    ) -> usize {
+        let mut sent = 0;
+        for session in sessions {
+            if self.enqueue_async(&session, frame.clone()).await.is_ok() {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     async fn send_to_user_inner(
@@ -215,7 +266,10 @@ impl RustWing {
                 .disconnect_user_in(connection_type, user_id, frame.payload)
                 .await;
         }
-        let sent = self.send_local(&connection_type, &user_id, frame.clone())?;
+        let sessions = self.sessions_for_user(&connection_type, &user_id);
+        let sent = self
+            .enqueue_local_sessions_async(sessions, frame.clone())
+            .await;
 
         let Some(cluster) = &self.inner.cluster else {
             return Ok(DeliveryReport {
@@ -247,10 +301,38 @@ impl RustWing {
         })
     }
 
-    // Deliver a received cluster envelope locally 在本地投递收到的集群信封
-    pub fn handle_cluster_envelope(&self, envelope: ClusterEnvelope) -> Result<usize> {
+    // Deliver a received cluster envelope locally and await complete session cleanup 在本地投递集群信封并等待会话完整清理
+    pub async fn handle_cluster_envelope_async(&self, envelope: ClusterEnvelope) -> Result<usize> {
+        let disconnect_cause = envelope.disconnect_cause.clone();
         let target = envelope.target.clone();
         let frame = envelope.into_frame();
+        if frame.kind == FrameKind::Close {
+            let cause = close_frame_cause(&frame, disconnect_cause);
+            let sessions = self.sessions_for_cluster_target(&target)?;
+            return self
+                .unregister_local_sessions_with_cause(sessions, cause)
+                .await;
+        }
+
+        let sessions = self.sessions_for_cluster_target(&target)?;
+        Ok(self.enqueue_local_sessions_async(sessions, frame).await)
+    }
+
+    // Deliver a received cluster envelope locally 在本地投递收到的集群信封
+    pub fn handle_cluster_envelope(&self, envelope: ClusterEnvelope) -> Result<usize> {
+        let disconnect_cause = envelope.disconnect_cause.clone();
+        let target = envelope.target.clone();
+        let frame = envelope.into_frame();
+        if frame.kind == FrameKind::Close {
+            let cause = close_frame_cause(&frame, disconnect_cause);
+            let sessions = self.sessions_for_cluster_target(&target)?;
+            let removed = sessions
+                .into_iter()
+                .filter(|session| self.remove_local_session_with_cause(session, cause.clone()))
+                .count();
+            return Ok(removed);
+        }
+
         match target {
             ClusterTarget::User {
                 connection_type,
@@ -268,11 +350,6 @@ impl RustWing {
                 let Some(session) = self.get_session(&session_id)? else {
                     return Ok(0);
                 };
-                if frame.kind == FrameKind::Close {
-                    session.close(frame.payload);
-                    self.inner.registry.remove(&session);
-                    return Ok(1);
-                }
                 Ok(usize::from(self.enqueue(&session, frame).is_ok()))
             }
             ClusterTarget::Broadcast { connection_type } => {
@@ -280,6 +357,67 @@ impl RustWing {
             }
             ClusterTarget::BroadcastAll => self.broadcast_local(frame),
         }
+    }
+
+    // Resolve local sessions addressed by one cluster target 解析一个集群目标对应的本地会话
+    fn sessions_for_cluster_target(&self, target: &ClusterTarget) -> Result<Vec<Session>> {
+        match target {
+            ClusterTarget::User {
+                connection_type,
+                user_id,
+            } => Ok(self.sessions_for_user(connection_type, user_id)),
+            ClusterTarget::Client {
+                connection_type,
+                user_id,
+                client_id,
+            } => {
+                let client_key = ClientRouteKey::new(
+                    connection_type.clone(),
+                    user_id.clone(),
+                    client_id.clone(),
+                );
+                Ok(self.inner.registry.sessions_for_client_key(&client_key))
+            }
+            ClusterTarget::Session { session_id } => {
+                Ok(self.get_session(session_id)?.into_iter().collect())
+            }
+            ClusterTarget::Broadcast { connection_type } => Ok(self
+                .inner
+                .registry
+                .sessions_for_connection_type(connection_type)),
+            ClusterTarget::BroadcastAll => Ok(self.all_sessions()),
+        }
+    }
+
+    // Remove local sessions with one exact cause and await Presence cleanup 使用同一精确原因移除本地会话并等待 Presence 清理
+    async fn unregister_local_sessions_with_cause(
+        &self,
+        sessions: Vec<Session>,
+        cause: DisconnectCause,
+    ) -> Result<usize> {
+        let mut removed = 0;
+        for session in sessions {
+            removed += usize::from(self.unregister_with_cause(&session, cause.clone()).await?);
+        }
+        Ok(removed)
+    }
+}
+
+// Convert a close frame and optional cluster metadata into one exact cause 将关闭帧和可选集群元数据转换为精确原因
+fn close_frame_cause(frame: &OutboundFrame, cause: Option<DisconnectCause>) -> DisconnectCause {
+    cause.unwrap_or_else(|| DisconnectCause::ServerRequested {
+        reason: String::from_utf8_lossy(&frame.payload).into_owned(),
+    })
+}
+
+// Convert a local enqueue failure into a typed disconnect cause 将本地入队失败转换为类型化断开原因
+pub(super) fn enqueue_failure_cause(error: &RustWingError) -> DisconnectCause {
+    match error {
+        RustWingError::QueueFull => DisconnectCause::OutboundQueueFull,
+        RustWingError::SessionClosed => DisconnectCause::OutboundReceiverClosed,
+        _ => DisconnectCause::TransportError {
+            message: error.to_string(),
+        },
     }
 }
 
@@ -311,7 +449,13 @@ impl RustWing {
         if frame.kind == FrameKind::Close {
             return self.disconnect_all_in(connection_type, frame.payload).await;
         }
-        let sent = self.broadcast_local_by_connection_type(&connection_type, frame.clone())?;
+        let sessions = self
+            .inner
+            .registry
+            .sessions_for_connection_type(&connection_type);
+        let sent = self
+            .enqueue_local_sessions_async(sessions, frame.clone())
+            .await;
         let routes = self.broadcast_routes(Some(&connection_type)).await?;
         let (remote_nodes, remote_failures) = self
             .publish_grouped_remote_routes(
@@ -332,7 +476,9 @@ impl RustWing {
         if frame.kind == FrameKind::Close {
             return self.disconnect_all(frame.payload).await;
         }
-        let sent = self.broadcast_local(frame.clone())?;
+        let sent = self
+            .enqueue_local_sessions_async(self.all_sessions(), frame.clone())
+            .await;
         let routes = self.broadcast_routes(None).await?;
         let (remote_nodes, remote_failures) = self
             .publish_grouped_remote_routes(

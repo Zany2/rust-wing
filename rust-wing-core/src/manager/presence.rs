@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::cluster::{NodeLease, Route};
+use crate::cluster::{NodeLease, Route, RouteClaim, RouteRefresh};
 use crate::error::{Result, RustWingError};
 use crate::identity::uuid_v7_simple;
 use crate::session::Session;
@@ -12,25 +12,27 @@ use crate::session::Session;
 use super::{Inner, RustWing};
 
 impl RustWing {
-    // Register a distributed route for one session 为一个会话注册分布式路由
-    pub(super) async fn register_presence(&self, session: &Session) -> Result<()> {
+    // Atomically claim a distributed route for one session 为一个会话原子仲裁分布式路由
+    pub(super) async fn claim_presence(&self, session: &Session) -> Result<RouteClaim> {
         let Some(cluster) = &self.inner.cluster else {
-            return Ok(());
+            return Ok(RouteClaim::default());
         };
         if !self.inner.config.cluster.enabled {
-            return Ok(());
+            return Ok(RouteClaim::default());
         }
 
+        let route = Route {
+            user_id: session.user_id().clone(),
+            connection_type: session.connection_type().clone(),
+            client_id: session.client_id().cloned(),
+            session_id: session.id().clone(),
+            node_id: self.inner.config.node_id.clone(),
+        };
         cluster
             .presence
-            .register(
-                Route {
-                    user_id: session.user_id().clone(),
-                    connection_type: session.connection_type().clone(),
-                    client_id: session.client_id().cloned(),
-                    session_id: session.id().clone(),
-                    node_id: self.inner.config.node_id.clone(),
-                },
+            .claim(
+                route,
+                self.inner.config.policy_for(session.connection_type()),
                 self.inner.config.cluster.route_ttl,
             )
             .await
@@ -83,14 +85,18 @@ impl RustWing {
             return;
         }
         let (lease_stop, stop_rx) = watch::channel(false);
-        {
-            let Some(inner) = Arc::get_mut(&mut self.inner) else {
-                return;
-            };
-            inner.lease_stop = Some(lease_stop);
-        }
+        *self
+            .inner
+            .lease_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(lease_stop);
         let task_inner = Arc::downgrade(&self.inner);
-        spawn_node_lease_refresher(task_inner, stop_rx);
+        let task = spawn_node_lease_refresher(task_inner, stop_rx);
+        *self
+            .inner
+            .lease_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(task);
     }
 
     // Refresh the distributed route for one session 刷新一个会话的分布式路由
@@ -105,7 +111,7 @@ impl RustWing {
         }
 
         // Extend the current session route lifetime 延长当前会话路由生命周期
-        cluster
+        let refresh = cluster
             .presence
             .touch(
                 session.connection_type(),
@@ -113,17 +119,32 @@ impl RustWing {
                 session.id(),
                 self.inner.config.cluster.route_ttl,
             )
-            .await
+            .await?;
+        if refresh == RouteRefresh::Lost {
+            self.unregister_with_cause(session, crate::lifecycle::DisconnectCause::Replaced)
+                .await?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Inner {
     // Signal the lease refresher to stop when the manager is dropped 管理器释放时通知租约刷新任务停止
     fn drop(&mut self) {
-        if let Some(lease_stop) = &self.lease_stop {
+        if let Some(lease_stop) = self
+            .lease_stop
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
             let _ = lease_stop.send(true);
         }
-        if let Some(maintenance_stop) = &self.maintenance_stop {
+        if let Some(maintenance_stop) = self
+            .maintenance_stop
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
             let _ = maintenance_stop.send(true);
         }
     }
@@ -153,7 +174,7 @@ fn spawn_node_lease_refresher(
                     if !inner.config.cluster.enabled {
                         break;
                     }
-                    let _ = cluster
+                    let result = cluster
                         .presence
                         .register_node(
                             &inner.config.node_id,
@@ -161,6 +182,20 @@ fn spawn_node_lease_refresher(
                             inner.config.cluster.node_lease_ttl,
                         )
                         .await;
+                    match result {
+                        Ok(NodeLease::Acquired | NodeLease::Refreshed) => {
+                            inner.runtime.mark_node_lease_healthy();
+                        }
+                        Ok(NodeLease::Conflict) => {
+                            inner.runtime.mark_node_lease_unhealthy(format!(
+                                "node_id '{}' lease is owned by another instance",
+                                inner.config.node_id.as_str()
+                            ));
+                        }
+                        Err(error) => {
+                            inner.runtime.mark_node_lease_unhealthy(error.to_string());
+                        }
+                    }
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {

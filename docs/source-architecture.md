@@ -196,6 +196,7 @@ flowchart LR
     NatsSubscriber["NatsNodeSubscriberAdapter"]
     KafkaPublisher["KafkaNodePublisherAdapter"]
     KafkaSubscriber["KafkaNodeSubscriberAdapter"]
+    Runtime["DistributedRustWing<br/>managed lifecycle"]
     CoreDelivery["RustWing::handle_cluster_envelope"]
 
     PresenceAdapter --> BridgePresence --> CorePresence
@@ -208,12 +209,21 @@ flowchart LR
     RedisSubscriber --> CoreDelivery
     NatsSubscriber --> CoreDelivery
     KafkaSubscriber --> CoreDelivery
+    Runtime --> RedisPresence
+    Runtime --> RedisPublisher
+    Runtime --> RedisSubscriber
+    Runtime --> NatsPublisher
+    Runtime --> NatsSubscriber
+    Runtime --> KafkaPublisher
+    Runtime --> KafkaSubscriber
 ```
 
 Presence and node transport are composed independently. Redis remains the
 shared production implementation for route storage and node leases. Node
 envelopes can be transported by Redis Pub/Sub, NATS subjects, or Kafka topics;
 each runtime must pair the publisher and subscriber from the same transport.
+`DistributedRustWing` performs that pairing, starts the selected subscriber,
+and shuts down both the subscriber and core runtime through one managed handle.
 Redis command adapters select standalone, Cluster, or Sentinel connections
 through `RedisDeployment`. Presence keys use one versioned hash tag so atomic
 pipelines remain valid in Redis Cluster, and a session set replaces global

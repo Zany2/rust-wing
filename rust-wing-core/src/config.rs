@@ -14,6 +14,8 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 // Default outbound queue size 默认写队列容量
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
+// Default session lifecycle event channel capacity 默认会话生命周期事件通道容量
+const DEFAULT_SESSION_EVENT_CAPACITY: usize = 256;
 // Default cluster route lifetime 默认集群路由有效期
 const DEFAULT_ROUTE_TTL: Duration = Duration::from_secs(90);
 // Default cluster node lease lifetime 默认集群节点租约有效期
@@ -49,6 +51,8 @@ pub struct RustWingConfig {
     pub heartbeat_timeout: Duration,
     // Per-session outbound queue capacity 每个会话的写队列容量
     pub write_queue_capacity: usize,
+    // Session lifecycle event channel capacity 会话生命周期事件通道容量
+    pub session_event_capacity: usize,
     // Default session coexistence policy 默认会话共存策略
     pub default_connection_policy: ConnectionPolicy,
     // Per-connection-system policy overrides 连接体系级策略覆盖
@@ -93,6 +97,7 @@ impl Default for RustWingConfig {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
             write_queue_capacity: DEFAULT_WRITE_QUEUE_CAPACITY,
+            session_event_capacity: DEFAULT_SESSION_EVENT_CAPACITY,
             default_connection_policy: ConnectionPolicy::UniqueClient,
             connection_policies: HashMap::new(),
             maintenance: MaintenanceConfig::default(),
@@ -221,6 +226,12 @@ impl RustWingConfig {
         self
     }
 
+    // Set the bounded session lifecycle event channel capacity 设置有界会话生命周期事件通道容量
+    pub fn with_session_event_capacity(mut self, session_event_capacity: usize) -> Self {
+        self.session_event_capacity = session_event_capacity;
+        self
+    }
+
     // Replace the full maintenance configuration 替换完整维护配置
     pub fn with_maintenance(mut self, maintenance: MaintenanceConfig) -> Self {
         self.maintenance = maintenance;
@@ -327,6 +338,11 @@ impl RustWingConfig {
                 "write_queue_capacity cannot be zero".into(),
             ));
         }
+        if self.session_event_capacity == 0 {
+            return Err(RustWingError::InvalidConfig(
+                "session_event_capacity cannot be zero".into(),
+            ));
+        }
         if self.maintenance.enabled && self.maintenance.interval.is_zero() {
             return Err(RustWingError::InvalidConfig(
                 "maintenance interval cannot be zero".into(),
@@ -382,6 +398,10 @@ impl RustWingConfig {
         // Keep every session queue usable 保持每个会话队列可用
         if self.write_queue_capacity == 0 {
             self.write_queue_capacity = DEFAULT_WRITE_QUEUE_CAPACITY;
+        }
+        // Keep lifecycle notifications bounded but usable 保持生命周期通知有界且可用
+        if self.session_event_capacity == 0 {
+            self.session_event_capacity = DEFAULT_SESSION_EVENT_CAPACITY;
         }
         // Keep enabled maintenance from busy-looping 避免启用的维护任务忙循环
         if self.maintenance.interval.is_zero() {

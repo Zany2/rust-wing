@@ -1,13 +1,24 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rust_wing_core::{ConnectionType, NodeId, NodeLease, Result, Route, SessionId, UserId};
+use rust_wing_core::{
+    ConnectionPolicy, ConnectionType, NodeId, NodeLease, Result, Route, RouteClaim, RouteRefresh,
+    SessionId, UserId,
+};
 
 // Presence storage adapter interface 在线路由存储适配器接口
 #[async_trait]
 pub trait PresenceStoreAdapter: Send + Sync {
     // Register a route with a finite lifetime 注册带有效期的路由
     async fn register(&self, route: Route, ttl: Duration) -> Result<()>;
+
+    // Atomically claim a route according to the connection policy 按连接策略原子仲裁并注册路由
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim>;
 
     // Remove one exact connection-user-session route 删除指定连接体系用户会话路由
     async fn remove(
@@ -24,7 +35,7 @@ pub trait PresenceStoreAdapter: Send + Sync {
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()>;
+    ) -> Result<RouteRefresh>;
 
     // Locate all live routes for one connection-user pair 查询连接体系用户当前可用路由
     async fn locate(
@@ -90,6 +101,16 @@ where
         self.inner.register(route, ttl).await
     }
 
+    // Claim a route through the adapter 通过适配器原子仲裁路由
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim> {
+        self.inner.claim(route, policy, ttl).await
+    }
+
     // Remove a route through the adapter 通过适配器删除路由
     async fn remove(
         &self,
@@ -109,7 +130,7 @@ where
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<RouteRefresh> {
         self.inner
             .touch(connection_type, user_id, session_id, ttl)
             .await

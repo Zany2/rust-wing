@@ -4,8 +4,11 @@ use rust_wing_core::{ClusterEnvelope, NodeId, Result, RustWing, RustWingError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::NodePublisherAdapter;
 use crate::messaging::{ExternalMessageConsumerStats, process_external_message_payload};
+use crate::{
+    ManagedNodeSubscriber, NodePublisherAdapter, NodeSubscriberAdapter, NodeSubscriberStats,
+    NodeSubscriberStatsSnapshot, NodeSubscriberStatus,
+};
 
 // NATS node message transport configuration NATS 节点消息传输配置
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,10 @@ pub struct NatsNodeSubscriberHandle {
     stop: watch::Sender<bool>,
     // Background subscriber task 后台订阅任务
     task: JoinHandle<Result<()>>,
+    // Latest subscriber lifecycle state 最新订阅器生命周期状态
+    status: watch::Receiver<NodeSubscriberStatus>,
+    // Shared subscriber counters 共享的订阅器计数器
+    stats: NodeSubscriberStats,
 }
 
 // NATS external message consumer configuration NATS 外部消息消费者配置
@@ -150,24 +157,71 @@ impl NatsNodeSubscriberAdapter {
     // Consume messages for one node until the subscription ends 为指定节点持续消费消息直到订阅结束
     pub async fn run_for_node(&self, node_id: NodeId, wing: RustWing) -> Result<()> {
         let (_stop_tx, stop_rx) = watch::channel(false);
-        self.run_for_node_until_stop(node_id, wing, stop_rx).await
+        let (status_tx, _status_rx) = watch::channel(NodeSubscriberStatus::Starting);
+        self.run_for_node_until_stop(
+            node_id,
+            wing,
+            stop_rx,
+            status_tx,
+            NodeSubscriberStats::default(),
+        )
+        .await
     }
 
-    // Start a managed subscriber task for the manager's configured node 为管理器当前节点启动托管订阅任务
+    // Spawn a subscriber task without waiting for subscription readiness 不等待订阅就绪并启动当前节点订阅任务
     pub fn spawn_current_node(&self, wing: RustWing) -> NatsNodeSubscriberHandle {
         self.spawn_for_node(wing.config().node_id.clone(), wing)
     }
 
-    // Start a managed subscriber task for one node 为指定节点启动托管订阅任务
+    // Spawn one subscriber task without waiting for subscription readiness 不等待订阅就绪并启动指定节点订阅任务
     pub fn spawn_for_node(&self, node_id: NodeId, wing: RustWing) -> NatsNodeSubscriberHandle {
         let subscriber = self.clone();
         let (stop, stop_rx) = watch::channel(false);
+        let (status_tx, status) = watch::channel(NodeSubscriberStatus::Starting);
+        let stats = NodeSubscriberStats::default();
+        let task_stats = stats.clone();
         let task = tokio::spawn(async move {
             subscriber
-                .run_for_node_until_stop(node_id, wing, stop_rx)
+                .run_for_node_until_stop(node_id, wing, stop_rx, status_tx, task_stats)
                 .await
         });
-        NatsNodeSubscriberHandle { stop, task }
+        NatsNodeSubscriberHandle {
+            stop,
+            task,
+            status,
+            stats,
+        }
+    }
+
+    // Start a ready subscriber for the manager's configured node 为管理器当前节点启动已就绪的订阅器
+    pub async fn start_current_node(&self, wing: RustWing) -> Result<NatsNodeSubscriberHandle> {
+        self.start_for_node(wing.config().node_id.clone(), wing)
+            .await
+    }
+
+    // Start a node subscriber after the NATS subscription succeeds 在 NATS 订阅成功后启动指定节点订阅器
+    pub async fn start_for_node(
+        &self,
+        node_id: NodeId,
+        wing: RustWing,
+    ) -> Result<NatsNodeSubscriberHandle> {
+        let subscriber = self.subscribe_for_node(&node_id).await?;
+        let (stop, stop_rx) = watch::channel(false);
+        let (status_tx, status) = watch::channel(NodeSubscriberStatus::Running);
+        let stats = NodeSubscriberStats::default();
+        let task = tokio::spawn(Self::consume_subscription(
+            subscriber,
+            wing,
+            stop_rx,
+            status_tx,
+            stats.clone(),
+        ));
+        Ok(NatsNodeSubscriberHandle {
+            stop,
+            task,
+            status,
+            stats,
+        })
     }
 
     // Consume messages until the subscription ends or a stop signal arrives 消费消息直到订阅结束或收到停止信号
@@ -175,38 +229,89 @@ impl NatsNodeSubscriberAdapter {
         &self,
         node_id: NodeId,
         wing: RustWing,
-        mut stop_rx: watch::Receiver<bool>,
+        stop_rx: watch::Receiver<bool>,
+        status: watch::Sender<NodeSubscriberStatus>,
+        stats: NodeSubscriberStats,
     ) -> Result<()> {
-        let subject = nats_node_subject(&self.config.subject_prefix, &node_id)?;
-        let mut subscriber = self
+        let subscriber = match self.subscribe_for_node(&node_id).await {
+            Ok(subscriber) => subscriber,
+            Err(error) => {
+                stats.record_consume_failed();
+                let _ = status.send(NodeSubscriberStatus::Failed(error.to_string()));
+                return Err(error);
+            }
+        };
+        Self::consume_subscription(subscriber, wing, stop_rx, status, stats).await
+    }
+
+    // Create a NATS subscription for one node 创建指定节点的 NATS 订阅
+    async fn subscribe_for_node(&self, node_id: &NodeId) -> Result<async_nats::Subscriber> {
+        let subject = nats_node_subject(&self.config.subject_prefix, node_id)?;
+        let subscriber = self
             .client
             .subscribe(subject)
             .await
             .map_err(|error| nats_error("subscribe nats node subject", error))?;
+        // Flush the SUB command so callers cannot publish before the server observes readiness 刷新 SUB 命令以避免调用方在服务端确认就绪前发布
+        self.client
+            .flush()
+            .await
+            .map_err(|error| nats_error("flush nats node subscription", error))?;
+        Ok(subscriber)
+    }
 
+    // Consume one established NATS subscription 消费一个已经建立的 NATS 订阅
+    async fn consume_subscription(
+        mut subscriber: async_nats::Subscriber,
+        wing: RustWing,
+        mut stop_rx: watch::Receiver<bool>,
+        status: watch::Sender<NodeSubscriberStatus>,
+        stats: NodeSubscriberStats,
+    ) -> Result<()> {
+        let _ = status.send(NodeSubscriberStatus::Running);
         loop {
             tokio::select! {
                 message = subscriber.next() => {
                     let Some(message) = message else {
-                        break;
+                        stats.record_consume_failed();
+                        let error = RustWingError::Cluster("nats node subscription ended".into());
+                        let _ = status.send(NodeSubscriberStatus::Failed(error.to_string()));
+                        return Err(error);
                     };
-                    let Ok(envelope) = serde_json::from_slice::<ClusterEnvelope>(&message.payload) else {
-                        continue;
+                    stats.record_received();
+                    let envelope = match serde_json::from_slice::<ClusterEnvelope>(&message.payload) {
+                        Ok(envelope) => envelope,
+                        Err(_) => {
+                            stats.record_decode_failed();
+                            continue;
+                        }
                     };
-                    let _ = wing.handle_cluster_envelope(envelope);
+                    if wing.handle_cluster_envelope_async(envelope).await.is_err() {
+                        stats.record_delivery_failed();
+                    }
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
-                        break;
+                        let _ = status.send(NodeSubscriberStatus::Stopped);
+                        return Ok(());
                     }
                 }
             }
         }
-        Ok(())
     }
 }
 
 impl NatsNodeSubscriberHandle {
+    // Return the latest subscriber lifecycle state 返回最新的订阅器生命周期状态
+    pub fn status(&self) -> NodeSubscriberStatus {
+        self.status.borrow().clone()
+    }
+
+    // Return a point-in-time subscriber counter snapshot 返回订阅器计数器的时间点快照
+    pub fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     // Ask the subscriber task to stop and wait for it 请求订阅任务停止并等待结束
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(true);
@@ -220,6 +325,34 @@ impl NatsNodeSubscriberHandle {
         self.task
             .await
             .map_err(|error| RustWingError::Cluster(format!("nats subscriber task: {error}")))?
+    }
+}
+
+#[async_trait]
+impl NodeSubscriberAdapter for NatsNodeSubscriberAdapter {
+    async fn start_for_node(
+        &self,
+        node_id: NodeId,
+        wing: RustWing,
+    ) -> Result<Box<dyn ManagedNodeSubscriber>> {
+        NatsNodeSubscriberAdapter::start_for_node(self, node_id, wing)
+            .await
+            .map(|subscriber| Box::new(subscriber) as Box<dyn ManagedNodeSubscriber>)
+    }
+}
+
+#[async_trait]
+impl ManagedNodeSubscriber for NatsNodeSubscriberHandle {
+    fn status(&self) -> NodeSubscriberStatus {
+        NatsNodeSubscriberHandle::status(self)
+    }
+
+    fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        NatsNodeSubscriberHandle::stats(self)
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<()> {
+        NatsNodeSubscriberHandle::shutdown(*self).await
     }
 }
 

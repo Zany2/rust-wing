@@ -1,11 +1,10 @@
 use std::collections::HashSet;
 
 use crate::cluster::{ClusterEnvelope, Route};
-use crate::config::ConnectionPolicy;
 use crate::error::Result;
 use crate::identity::{ClientId, ConnectionType, SessionId, UserId};
+use crate::lifecycle::DisconnectCause;
 use crate::protocol::OutboundFrame;
-use crate::session::Session;
 
 use super::registry::ClientRouteKey;
 use super::{DeliveryReport, RustWing};
@@ -31,11 +30,12 @@ impl RustWing {
         let connection_type = connection_type.into();
         let user_id = user_id.into();
         let reason = reason.into();
+        let cause = server_requested_cause(&reason);
         let local_sessions = self
-            .disconnect_local_user(&connection_type, &user_id)
+            .disconnect_local_user(&connection_type, &user_id, cause.clone())
             .await?;
         let remote_nodes = self
-            .disconnect_remote_user_routes(&connection_type, &user_id, None, reason)
+            .disconnect_remote_user_routes(&connection_type, &user_id, None, reason, cause)
             .await?;
         let report = DeliveryReport {
             local_sessions,
@@ -77,11 +77,18 @@ impl RustWing {
         let user_id = user_id.into();
         let client_id = client_id.map(Into::into);
         let reason = reason.into();
+        let cause = server_requested_cause(&reason);
         let local_sessions = self
-            .disconnect_local_client(&connection_type, &user_id, client_id.clone())
+            .disconnect_local_client(&connection_type, &user_id, client_id.clone(), cause.clone())
             .await?;
         let remote_nodes = self
-            .disconnect_remote_user_routes(&connection_type, &user_id, Some(client_id), reason)
+            .disconnect_remote_user_routes(
+                &connection_type,
+                &user_id,
+                Some(client_id),
+                reason,
+                cause,
+            )
             .await?;
         let report = DeliveryReport {
             local_sessions,
@@ -101,10 +108,11 @@ impl RustWing {
         reason: impl Into<Vec<u8>>,
     ) -> Result<DeliveryReport> {
         let reason = reason.into();
+        let cause = server_requested_cause(&reason);
         if let Some(session) = self.get_session(session_id)? {
-            self.unregister(&session).await?;
+            let removed = self.unregister_with_cause(&session, cause).await?;
             let report = DeliveryReport {
-                local_sessions: 1,
+                local_sessions: usize::from(removed),
                 remote_nodes: 0,
                 remote_failures: 0,
             };
@@ -132,7 +140,7 @@ impl RustWing {
             return Ok(DeliveryReport::default());
         }
 
-        self.publish_disconnect(&route, reason).await?;
+        self.publish_disconnect(&route, reason, cause).await?;
         cluster
             .presence
             .remove(&route.connection_type, &route.user_id, &route.session_id)
@@ -156,19 +164,22 @@ impl RustWing {
     ) -> Result<DeliveryReport> {
         let connection_type = connection_type.into();
         let reason = reason.into();
+        let cause = server_requested_cause(&reason);
         let sessions = self
             .inner
             .registry
             .sessions_for_connection_type(&connection_type);
+        let mut local_sessions = 0;
         for session in &sessions {
-            self.unregister(session).await?;
+            local_sessions +=
+                usize::from(self.unregister_with_cause(session, cause.clone()).await?);
         }
         let routes = self
             .cluster_routes_for_disconnect(Some(&connection_type))
             .await?;
-        let remote_nodes = self.disconnect_remote_routes(routes, reason).await?;
+        let remote_nodes = self.disconnect_remote_routes(routes, reason, cause).await?;
         let report = DeliveryReport {
-            local_sessions: sessions.len(),
+            local_sessions,
             remote_nodes,
             remote_failures: 0,
         };
@@ -181,14 +192,17 @@ impl RustWing {
     // Disconnect every local and remote session 断开全部本地与远端会话
     pub async fn disconnect_all(&self, reason: impl Into<Vec<u8>>) -> Result<DeliveryReport> {
         let reason = reason.into();
+        let cause = server_requested_cause(&reason);
         let sessions = self.all_sessions();
+        let mut local_sessions = 0;
         for session in &sessions {
-            self.unregister(session).await?;
+            local_sessions +=
+                usize::from(self.unregister_with_cause(session, cause.clone()).await?);
         }
         let routes = self.cluster_routes_for_disconnect(None).await?;
-        let remote_nodes = self.disconnect_remote_routes(routes, reason).await?;
+        let remote_nodes = self.disconnect_remote_routes(routes, reason, cause).await?;
         let report = DeliveryReport {
-            local_sessions: sessions.len(),
+            local_sessions,
             remote_nodes,
             remote_failures: 0,
         };
@@ -198,60 +212,30 @@ impl RustWing {
         Ok(report)
     }
 
-    // Close cluster sessions displaced by the local session policy 按本地会话策略关闭被替换的集群会话
-    pub(super) async fn close_displaced_cluster_sessions(&self, session: &Session) -> Result<()> {
-        let policy = self.inner.config.policy_for(session.connection_type());
-        if policy == ConnectionPolicy::MultiSession {
-            return Ok(());
-        }
+    // Close routes displaced by an atomic local claim 关闭原子仲裁中被替换的路由
+    pub(super) async fn close_displaced_cluster_sessions(&self, routes: Vec<Route>) -> Result<()> {
         if self.inner.cluster.is_none() || !self.inner.config.cluster.enabled {
             return Ok(());
         }
 
-        let routes = {
-            let Some(cluster) = &self.inner.cluster else {
-                return Ok(());
-            };
-            cluster
-                .presence
-                .locate(session.connection_type(), session.user_id())
-                .await?
-        };
-
         for route in routes {
-            if route.session_id == *session.id() {
-                continue;
-            }
-            if !route_displaced_by(policy, &route, session) {
-                continue;
-            }
-
             if route.node_id == self.inner.config.node_id {
                 if let Some(displaced) = self.get_session(&route.session_id)? {
-                    self.unregister(&displaced).await?;
-                } else if let Some(cluster) = &self.inner.cluster {
-                    cluster
-                        .presence
-                        .remove(&route.connection_type, &route.user_id, &route.session_id)
+                    self.unregister_with_cause_unlocked(&displaced, DisconnectCause::Replaced)
                         .await?;
                 }
                 continue;
             }
 
-            if let Some(cluster) = &self.inner.cluster {
-                self.publish_cluster_envelope(
-                    &route.node_id,
-                    ClusterEnvelope::new_for_session(
-                        route.session_id.clone(),
-                        OutboundFrame::close("replaced by a newer connection"),
-                    ),
+            self.publish_cluster_envelope(
+                &route.node_id,
+                ClusterEnvelope::new_for_session(
+                    route.session_id.clone(),
+                    OutboundFrame::close("replaced by a newer connection"),
                 )
-                .await?;
-                cluster
-                    .presence
-                    .remove(&route.connection_type, &route.user_id, &route.session_id)
-                    .await?;
-            }
+                .with_disconnect_cause(DisconnectCause::Replaced),
+            )
+            .await?;
         }
 
         Ok(())
@@ -262,12 +246,14 @@ impl RustWing {
         &self,
         connection_type: &ConnectionType,
         user_id: &UserId,
+        cause: DisconnectCause,
     ) -> Result<usize> {
         let sessions = self.sessions_for_user(connection_type, user_id);
+        let mut removed = 0;
         for session in &sessions {
-            self.unregister(session).await?;
+            removed += usize::from(self.unregister_with_cause(session, cause.clone()).await?);
         }
-        Ok(sessions.len())
+        Ok(removed)
     }
 
     // Disconnect local sessions for one user-client key 断开某个用户客户端键的本地会话
@@ -276,13 +262,15 @@ impl RustWing {
         connection_type: &ConnectionType,
         user_id: &UserId,
         client_id: Option<ClientId>,
+        cause: DisconnectCause,
     ) -> Result<usize> {
         let client_key = ClientRouteKey::new(connection_type.clone(), user_id.clone(), client_id);
         let sessions = self.inner.registry.sessions_for_client_key(&client_key);
+        let mut removed = 0;
         for session in &sessions {
-            self.unregister(session).await?;
+            removed += usize::from(self.unregister_with_cause(session, cause.clone()).await?);
         }
-        Ok(sessions.len())
+        Ok(removed)
     }
 
     // Disconnect matching remote user routes through cluster messages 通过集群消息断开匹配的远端用户路由
@@ -292,6 +280,7 @@ impl RustWing {
         user_id: &UserId,
         client_id: Option<Option<ClientId>>,
         reason: Vec<u8>,
+        cause: DisconnectCause,
     ) -> Result<usize> {
         let Some(cluster) = &self.inner.cluster else {
             return Ok(0);
@@ -310,7 +299,7 @@ impl RustWing {
             }
             if route.node_id == self.inner.config.node_id {
                 if let Some(session) = self.get_session(&route.session_id)? {
-                    self.unregister(&session).await?;
+                    self.unregister_with_cause(&session, cause.clone()).await?;
                 } else {
                     cluster
                         .presence
@@ -320,7 +309,8 @@ impl RustWing {
                 continue;
             }
 
-            self.publish_disconnect(&route, reason.clone()).await?;
+            self.publish_disconnect(&route, reason.clone(), cause.clone())
+                .await?;
             cluster
                 .presence
                 .remove(&route.connection_type, &route.user_id, &route.session_id)
@@ -348,7 +338,12 @@ impl RustWing {
     }
 
     // Disconnect already selected remote routes 断开已经筛选出的远端路由
-    async fn disconnect_remote_routes(&self, routes: Vec<Route>, reason: Vec<u8>) -> Result<usize> {
+    async fn disconnect_remote_routes(
+        &self,
+        routes: Vec<Route>,
+        reason: Vec<u8>,
+        cause: DisconnectCause,
+    ) -> Result<usize> {
         let Some(cluster) = &self.inner.cluster else {
             return Ok(0);
         };
@@ -360,7 +355,7 @@ impl RustWing {
         for route in routes {
             if route.node_id == self.inner.config.node_id {
                 if let Some(session) = self.get_session(&route.session_id)? {
-                    self.unregister(&session).await?;
+                    self.unregister_with_cause(&session, cause.clone()).await?;
                 } else {
                     cluster
                         .presence
@@ -370,7 +365,8 @@ impl RustWing {
                 continue;
             }
 
-            self.publish_disconnect(&route, reason.clone()).await?;
+            self.publish_disconnect(&route, reason.clone(), cause.clone())
+                .await?;
             cluster
                 .presence
                 .remove(&route.connection_type, &route.user_id, &route.session_id)
@@ -381,23 +377,29 @@ impl RustWing {
     }
 
     // Publish a remote session close envelope 发布远端会话关闭信封
-    async fn publish_disconnect(&self, route: &Route, reason: Vec<u8>) -> Result<()> {
+    async fn publish_disconnect(
+        &self,
+        route: &Route,
+        reason: Vec<u8>,
+        cause: DisconnectCause,
+    ) -> Result<()> {
         self.publish_cluster_envelope(
             &route.node_id,
             ClusterEnvelope::new_for_session(
                 route.session_id.clone(),
                 OutboundFrame::close(reason),
-            ),
+            )
+            .with_disconnect_cause(cause),
         )
         .await
     }
 }
 
-// Check whether one route is replaced by a newer local session 检查路由是否被新的本地会话替换
-fn route_displaced_by(policy: ConnectionPolicy, route: &Route, session: &Session) -> bool {
-    match policy {
-        ConnectionPolicy::UniqueUser => true,
-        ConnectionPolicy::UniqueClient => route.client_id.as_ref() == session.client_id(),
-        ConnectionPolicy::MultiSession => false,
+// Convert a close-frame payload into a typed server request cause 将关闭帧负载转换为类型化服务端请求原因
+fn server_requested_cause(reason: &[u8]) -> DisconnectCause {
+    DisconnectCause::ServerRequested {
+        reason: String::from_utf8_lossy(reason).into_owned(),
     }
 }
+
+// Check whether one route is replaced by a newer local session 检查路由是否被新的本地会话替换

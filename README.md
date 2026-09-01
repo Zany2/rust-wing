@@ -375,8 +375,46 @@ async fn main() -> rust_wing_core::Result<()> {
 ```
 
 Route storage and the node-to-node message channel are intentionally separate.
-Use `rust_wing_from_adapters` when they come from different infrastructure, for
-example Redis for routes and Kafka/NATS/custom middleware for cluster messages:
+For a managed Redis-presence runtime with a selectable transport, use
+`DistributedRustWing`. It starts the matching subscriber and shuts down both
+the subscriber and core runtime through one handle:
+
+```rust
+use rust_wing_adapter::{
+    DistributedRuntimeConfig, DistributedRustWing, NatsPublisherConfig,
+    RedisPresenceConfig,
+};
+use rust_wing_core::RustWingConfig;
+
+# async fn build() -> rust_wing_core::Result<()> {
+let runtime = DistributedRustWing::connect(
+    RustWingConfig::default().with_node_id("node-a"),
+    DistributedRuntimeConfig::new(
+        RedisPresenceConfig::new("redis://127.0.0.1:6379"),
+        NatsPublisherConfig::from_urls([
+            "nats://nats-1:4222",
+            "nats://nats-2:4222",
+        ]),
+    ),
+)
+.await?;
+
+let wing = runtime.wing_clone();
+// Use wing for WebSocket sessions and delivery.
+
+runtime.shutdown().await?;
+# Ok(())
+# }
+```
+
+Enable the `redis` feature plus the selected `redis`, `nats`, or `kafka`
+transport feature. Redis always stores presence and node leases. Replace the
+NATS configuration above with `RedisPublisherConfig` or `KafkaPublisherConfig`
+to select another transport. Kafka is currently available only on non-Windows
+targets.
+
+Use `rust_wing_from_adapters` when an application needs manual subscriber
+lifecycle control or custom middleware:
 
 ```rust
 use rust_wing_adapter::{
@@ -410,7 +448,7 @@ wing.shutdown().await?;
 # }
 ```
 
-Enable the `redis` and `nats` features for this composition. Kafka offers the
+Enable the `redis` and `nats` features for this manual composition. Kafka offers the
 same `KafkaNodePublisherAdapter` / `KafkaNodeSubscriberAdapter` split on
 non-Windows targets. Kafka uses one topic and consumer group per `NodeId`; the
 broker must allow automatic topic creation or the node topics must be created

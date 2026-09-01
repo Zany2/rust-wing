@@ -2,7 +2,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request};
 use rust_wing_core::cluster::NoopPublisher;
 use rust_wing_core::{
-    Cluster, ClusterConfig, ConnectionPolicy, FrameKind, MemoryPresenceStore, RustWingConfig,
+    Cluster, ClusterConfig, ConnectionPolicy, DisconnectCause, FrameKind, MemoryPresenceStore,
+    RustWingConfig,
 };
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -117,11 +118,15 @@ fn auth_error_converts_to_response() {
 // Reader task is cancelled when the writer task exits first 写任务先退出时读任务会被取消
 #[tokio::test]
 async fn writer_exit_cancels_reader_task() {
-    let outbound_task = tokio::spawn(async {});
+    let outbound_task = tokio::spawn(async {
+        DisconnectCause::TransportError {
+            message: "writer stopped".into(),
+        }
+    });
     let (cancelled_tx, cancelled_rx) = oneshot::channel();
     let inbound_task = tokio::spawn(async move {
         let _guard = CancelNotify(cancelled_tx);
-        std::future::pending::<()>().await;
+        std::future::pending::<DisconnectCause>().await
     });
 
     wait_for_socket_tasks(outbound_task, inbound_task).await;
@@ -135,9 +140,14 @@ async fn reader_exit_cancels_writer_task() {
     let (cancelled_tx, cancelled_rx) = oneshot::channel();
     let outbound_task = tokio::spawn(async move {
         let _guard = CancelNotify(cancelled_tx);
-        std::future::pending::<()>().await;
+        std::future::pending::<DisconnectCause>().await
     });
-    let inbound_task = tokio::spawn(async {});
+    let inbound_task = tokio::spawn(async {
+        DisconnectCause::ClientClosed {
+            code: None,
+            reason: None,
+        }
+    });
 
     wait_for_socket_tasks(outbound_task, inbound_task).await;
 

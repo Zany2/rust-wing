@@ -1,11 +1,14 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_wing_core::{
-    Cluster, ClusterConfig, ClusterEnvelope, ClusterTarget, ConnectionPolicy, ConnectionType,
-    FrameKind, Identity, MemoryPresenceStore, NodeId, NodeLease, NodePublisher, OutboundFrame,
-    PresenceStore, Result, Route, RustWing, RustWingConfig, RustWingError, SessionId, UserId,
+    AcceptedSession, ClientId, Cluster, ClusterConfig, ClusterEnvelope, ClusterTarget,
+    ConnectionPolicy, ConnectionType, DisconnectCause, FrameKind, Identity, MemoryPresenceStore,
+    NodeId, NodeLease, NodePublisher, OutboundFrame, PresenceStore, Result, Route, RouteClaim,
+    RouteRefresh, RuntimeStatus, RustWing, RustWingConfig, RustWingError, SessionEvent, SessionId,
+    UserId,
 };
 
 // Default single-client policy replaces only the same client 默认单客户端策略仅替换同一客户端
@@ -365,6 +368,294 @@ async fn shutdown_releases_sessions_and_node_lease() {
     assert!(second.is_ok());
 }
 
+// Shutdown is shared by clones and prevents accepting new sessions 关闭状态由克隆句柄共享并阻止接收新会话
+#[tokio::test]
+async fn shutdown_invalidates_cloned_manager_handles() {
+    let wing = RustWing::new(RustWingConfig::default());
+    let cloned = wing.clone();
+    let accepted = wing.accept_user("alice").await.unwrap();
+
+    assert_eq!(wing.runtime_status(), RuntimeStatus::Running);
+    assert!(wing.is_ready());
+    assert_eq!(wing.shutdown().await.unwrap(), 1);
+    assert_eq!(cloned.shutdown().await.unwrap(), 0);
+
+    assert!(accepted.session.is_closed());
+    assert_eq!(cloned.runtime_status(), RuntimeStatus::Stopped);
+    assert!(!cloned.is_ready());
+    assert!(!cloned.health().maintenance_running);
+    assert!(matches!(
+        cloned.accept_user("bob").await,
+        Err(RustWingError::RuntimeNotReady(status)) if status == "Stopped"
+    ));
+}
+
+// Lifecycle subscribers receive one connected and one typed disconnected event 生命周期订阅者会收到连接和类型化断开事件
+#[tokio::test]
+async fn lifecycle_events_report_connected_and_disconnected_once() {
+    let wing = RustWing::new(RustWingConfig::default().with_session_event_capacity(8));
+    let mut events = wing.subscribe_session_events();
+    let accepted = wing.accept_user("alice").await.unwrap();
+
+    let connected = events.recv().await.unwrap();
+    assert!(matches!(
+        connected,
+        SessionEvent::Connected { session }
+            if session.id.as_str() == accepted.session.id().as_str() && !session.closed
+    ));
+
+    assert!(
+        wing.unregister_with_cause(
+            &accepted.session,
+            DisconnectCause::ServerRequested {
+                reason: "logout".into(),
+            },
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !wing
+            .unregister_with_cause(&accepted.session, DisconnectCause::RuntimeShutdown)
+            .await
+            .unwrap()
+    );
+
+    let disconnected = events.recv().await.unwrap();
+    assert!(matches!(
+        disconnected,
+        SessionEvent::Disconnected { session, cause }
+            if session.closed
+                && session.id.as_str() == accepted.session.id().as_str()
+                && cause
+                    == (DisconnectCause::ServerRequested {
+                        reason: "logout".into(),
+                    })
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+// Session replacement emits a replacement cause before the new connection event 会话替换会先发出替换原因再发出新连接事件
+#[tokio::test]
+async fn lifecycle_events_report_replacement() {
+    let wing = RustWing::new(RustWingConfig::default().with_session_event_capacity(8));
+    let mut events = wing.subscribe_session_events();
+    let first = wing.accept_user("alice").await.unwrap();
+    let _ = events.recv().await.unwrap();
+
+    let _second = wing.accept_user("alice").await.unwrap();
+    let replaced = events.recv().await.unwrap();
+    assert!(matches!(
+        replaced,
+        SessionEvent::Disconnected { session, cause }
+            if session.id.as_str() == first.session.id().as_str()
+                && cause == DisconnectCause::Replaced
+    ));
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        SessionEvent::Connected { .. }
+    ));
+}
+
+// Slow lifecycle subscribers observe bounded-channel lag instead of blocking acceptance 慢生命周期订阅者会观察到有界通道丢失而不会阻塞接收
+#[tokio::test]
+async fn lifecycle_event_channel_reports_lag() {
+    let wing = RustWing::new(RustWingConfig::default().with_session_event_capacity(1));
+    let mut events = wing.subscribe_session_events();
+    let _first = wing.accept_user("alice").await.unwrap();
+    let _second = wing.accept_user("bob").await.unwrap();
+
+    assert!(matches!(
+        events.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+    ));
+}
+
+// A full outbound queue terminates the session and removes its distributed route 出站队列满会终止会话并移除分布式路由
+#[tokio::test]
+async fn outbound_queue_full_cleans_session_and_presence() {
+    let presence = SharedPresenceStore::default();
+    let wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            node_id: NodeId::from("node-a"),
+            write_queue_capacity: 1,
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(Cluster::new(
+            presence.clone(),
+            RecordingPublisher::default(),
+        )),
+    )
+    .await
+    .unwrap();
+    let mut events = wing.subscribe_session_events();
+    let accepted = wing.accept_user("alice").await.unwrap();
+    let session_id = accepted.session.id().clone();
+    let close_signal = accepted.session.subscribe_close();
+    let _ = events.recv().await.unwrap();
+
+    let first = wing
+        .send_to_session(&session_id, OutboundFrame::text("first"))
+        .await
+        .unwrap();
+    let rejected = wing
+        .send_to_session(&session_id, OutboundFrame::text("second"))
+        .await
+        .unwrap();
+
+    assert_eq!(first.local_sessions, 1);
+    assert_eq!(rejected.local_sessions, 0);
+    assert!(accepted.session.is_closed());
+    assert_eq!(wing.connection_count().unwrap(), 0);
+    assert!(
+        presence
+            .locate_session(&session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        close_signal.borrow().as_deref(),
+        Some(b"outbound queue full".as_slice())
+    );
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        SessionEvent::Disconnected { cause, .. }
+            if cause == DisconnectCause::OutboundQueueFull
+    ));
+}
+
+// Synchronous local close schedules distributed Presence cleanup 同步本地关闭会安排分布式 Presence 清理
+#[tokio::test]
+async fn synchronous_local_close_cleans_presence() {
+    let presence = SharedPresenceStore::default();
+    let wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            node_id: NodeId::from("node-a"),
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(Cluster::new(
+            presence.clone(),
+            RecordingPublisher::default(),
+        )),
+    )
+    .await
+    .unwrap();
+    let accepted = wing.accept_user("alice").await.unwrap();
+    let session_id = accepted.session.id().clone();
+
+    let removed = wing
+        .send_local(
+            &ConnectionType::default(),
+            &UserId::from("alice"),
+            OutboundFrame::close("local close"),
+        )
+        .unwrap();
+
+    assert_eq!(removed, 1);
+    assert!(accepted.session.is_closed());
+    assert_eq!(wing.connection_count().unwrap(), 0);
+    tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if presence
+                .locate_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// A dropped outbound receiver terminates the session exactly once 出站接收端被丢弃时会且只会终止一次会话
+#[tokio::test]
+async fn closed_outbound_receiver_terminates_session_once() {
+    let wing = RustWing::new(RustWingConfig::default());
+    let mut events = wing.subscribe_session_events();
+    let accepted = wing.accept_user("alice").await.unwrap();
+    let session = accepted.session.clone();
+    let session_id = session.id().clone();
+    let _ = events.recv().await.unwrap();
+    drop(accepted.outbound);
+
+    let report = wing
+        .send_to_session(&session_id, OutboundFrame::text("message"))
+        .await
+        .unwrap();
+
+    assert_eq!(report.local_sessions, 0);
+    assert!(session.is_closed());
+    assert_eq!(wing.connection_count().unwrap(), 0);
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        SessionEvent::Disconnected { cause, .. }
+            if cause == DisconnectCause::OutboundReceiverClosed
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+// Lease refresh failures degrade the runtime and successful refresh restores it 租约刷新失败会降级运行时且成功刷新会恢复
+#[tokio::test]
+async fn node_lease_health_tracks_refresh_failures_and_recovery() {
+    let presence = SharedPresenceStore::default();
+    let cluster = Cluster::new(presence.clone(), RecordingPublisher::default());
+    let config = RustWingConfig {
+        node_id: NodeId::from("node-a"),
+        cluster: ClusterConfig {
+            enabled: true,
+            node_lease_ttl: Duration::from_millis(300),
+            ..ClusterConfig::default()
+        },
+        ..RustWingConfig::default()
+    };
+    let wing = RustWing::with_cluster_checked(config, Some(cluster))
+        .await
+        .unwrap();
+
+    presence
+        .fail_node_registration
+        .store(true, Ordering::Release);
+    assert_eq!(
+        wait_for_runtime_status(&wing, RuntimeStatus::Degraded, Duration::from_millis(500)).await,
+        RuntimeStatus::Degraded
+    );
+    let degraded = wing.health();
+    assert!(!degraded.node_lease_healthy);
+    assert!(degraded.last_error.is_some());
+
+    presence
+        .fail_node_registration
+        .store(false, Ordering::Release);
+    assert_eq!(
+        wait_for_runtime_status(&wing, RuntimeStatus::Running, Duration::from_millis(500)).await,
+        RuntimeStatus::Running
+    );
+    let recovered = wing.health();
+    assert!(recovered.node_lease_healthy);
+    assert!(recovered.last_error.is_none());
+
+    wing.shutdown().await.unwrap();
+}
+
 // Cluster unique-client policy displaces matching remote sessions 集群单客户端策略会替换匹配的远端会话
 #[tokio::test]
 async fn cluster_unique_client_accept_closes_matching_remote_session() {
@@ -593,19 +884,26 @@ async fn cluster_multi_session_accept_keeps_remote_session() {
 #[tokio::test]
 async fn cluster_close_envelope_marks_session_closed() {
     let wing = RustWing::new(RustWingConfig::default());
+    let mut events = wing.subscribe_session_events();
     let mut accepted = wing.accept_user("alice").await.unwrap();
+    let _ = events.recv().await.unwrap();
     let envelope = ClusterEnvelope::new_for_session(
         accepted.session.id().clone(),
         OutboundFrame::close("replaced by a newer connection"),
-    );
+    )
+    .with_disconnect_cause(DisconnectCause::Replaced);
 
-    let delivered = wing.handle_cluster_envelope(envelope).unwrap();
+    let delivered = wing.handle_cluster_envelope_async(envelope).await.unwrap();
     let close_frame = accepted.outbound.recv().await.unwrap();
 
     assert_eq!(delivered, 1);
     assert!(accepted.session.is_closed());
     assert_eq!(close_frame.kind, FrameKind::Close);
     assert_eq!(wing.connection_count().unwrap(), 0);
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        SessionEvent::Disconnected { cause, .. } if cause == DisconnectCause::Replaced
+    ));
 }
 
 // Disconnecting a default-system user removes only that user's sessions 断开默认连接体系用户只移除该用户的会话
@@ -737,6 +1035,239 @@ async fn broadcast_all_close_disconnects_all_local_sessions() {
     assert_eq!(wing.connection_count().unwrap(), 0);
 }
 
+// Atomic claims enforce every connection policy and prevent stale refreshes 原子仲裁会执行全部连接策略并阻止旧路由续期
+#[tokio::test]
+async fn memory_presence_claim_enforces_policies_and_rejects_stale_touch() {
+    let presence = MemoryPresenceStore::new();
+    for node_id in ["node-a", "node-b", "node-c", "node-d"] {
+        register_test_node(&presence, node_id).await;
+    }
+    let route = |session_id: &str, client_id: Option<&str>, node_id: &str| Route {
+        connection_type: ConnectionType::from("default"),
+        user_id: UserId::from("alice"),
+        client_id: client_id.map(ClientId::from),
+        session_id: SessionId::from(session_id),
+        node_id: NodeId::from(node_id),
+    };
+    let first = route("session-a", Some("phone"), "node-a");
+    let second = route("session-b", Some("browser"), "node-b");
+    let replacement = route("session-c", Some("phone"), "node-c");
+
+    presence
+        .claim(
+            first.clone(),
+            ConnectionPolicy::UniqueClient,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    presence
+        .claim(
+            second.clone(),
+            ConnectionPolicy::UniqueClient,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let claim = presence
+        .claim(
+            replacement.clone(),
+            ConnectionPolicy::UniqueClient,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.displaced, vec![first.clone()]);
+    assert_eq!(
+        presence
+            .touch(
+                &first.connection_type,
+                &first.user_id,
+                &first.session_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        RouteRefresh::Lost
+    );
+    assert_eq!(
+        presence
+            .locate(&first.connection_type, &first.user_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let additional = route("session-d", None, "node-d");
+    let claim = presence
+        .claim(
+            additional.clone(),
+            ConnectionPolicy::MultiSession,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(claim.displaced.is_empty());
+
+    let exclusive = route("session-e", None, "node-a");
+    let claim = presence
+        .claim(
+            exclusive.clone(),
+            ConnectionPolicy::UniqueUser,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.displaced.len(), 3);
+    assert_eq!(
+        presence
+            .locate(&exclusive.connection_type, &exclusive.user_id)
+            .await
+            .unwrap(),
+        vec![exclusive.clone()]
+    );
+    assert_eq!(
+        presence
+            .touch(
+                &exclusive.connection_type,
+                &exclusive.user_id,
+                &exclusive.session_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        RouteRefresh::Refreshed
+    );
+}
+
+// Concurrent unique-user claims leave exactly one route owner 并发单用户仲裁最终只保留一个路由所有者
+#[tokio::test]
+async fn concurrent_memory_presence_unique_user_claims_leave_one_owner() {
+    let presence = Arc::new(MemoryPresenceStore::new());
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut routes = Vec::new();
+    let mut tasks = Vec::new();
+    for index in 0..16 {
+        let node_id = format!("node-{index}");
+        register_test_node(&presence, &node_id).await;
+        let route = Route {
+            connection_type: ConnectionType::from("default"),
+            user_id: UserId::from("alice"),
+            client_id: Some(ClientId::from(format!("client-{index}"))),
+            session_id: SessionId::from(format!("session-{index}")),
+            node_id: NodeId::from(node_id),
+        };
+        routes.push(route.clone());
+        let presence = presence.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            presence
+                .claim(route, ConnectionPolicy::UniqueUser, Duration::from_secs(60))
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let remaining = presence
+        .locate(&ConnectionType::from("default"), &UserId::from("alice"))
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    let mut refreshed = 0;
+    for route in routes {
+        refreshed += usize::from(
+            presence
+                .touch(
+                    &route.connection_type,
+                    &route.user_id,
+                    &route.session_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                == RouteRefresh::Refreshed,
+        );
+    }
+    assert_eq!(refreshed, 1);
+}
+
+// A displaced manager session closes when its next refresh observes lost ownership 被替换节点的会话会在续期发现所有权丢失时关闭
+#[tokio::test]
+async fn distributed_unique_user_loser_closes_on_presence_refresh() {
+    let presence = SharedPresenceStore::default();
+    let first_wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            node_id: NodeId::from("node-a"),
+            default_connection_policy: ConnectionPolicy::UniqueUser,
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(Cluster::new(
+            presence.clone(),
+            RecordingPublisher::default(),
+        )),
+    )
+    .await
+    .unwrap();
+    let second_wing = RustWing::with_cluster_checked(
+        RustWingConfig {
+            node_id: NodeId::from("node-b"),
+            default_connection_policy: ConnectionPolicy::UniqueUser,
+            cluster: ClusterConfig {
+                enabled: true,
+                ..ClusterConfig::default()
+            },
+            ..RustWingConfig::default()
+        },
+        Some(Cluster::new(
+            presence.clone(),
+            RecordingPublisher::default(),
+        )),
+    )
+    .await
+    .unwrap();
+
+    let (first, second) = tokio::join!(
+        first_wing.accept(Identity::new("default", "alice")),
+        second_wing.accept(Identity::new("default", "alice")),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let routes = presence
+        .locate(&ConnectionType::from("default"), &UserId::from("alice"))
+        .await
+        .unwrap();
+    assert_eq!(routes.len(), 1);
+
+    let (winner, winner_wing, loser, loser_wing) = if routes[0].session_id == *first.session.id() {
+        (&first.session, &first_wing, &second.session, &second_wing)
+    } else {
+        (&second.session, &second_wing, &first.session, &first_wing)
+    };
+    winner_wing.touch(winner).await.unwrap();
+    loser_wing.touch(loser).await.unwrap();
+
+    assert!(!winner.is_closed());
+    assert!(loser.is_closed());
+    assert!(loser_wing.get_session(loser.id()).unwrap().is_none());
+    assert_eq!(
+        presence
+            .locate(&ConnectionType::from("default"), &UserId::from("alice"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 // Remote session disconnect publishes a close envelope and removes the route 远端会话断开会发布关闭信封并移除路由
 #[tokio::test]
 async fn disconnect_session_publishes_to_remote_owner() {
@@ -795,6 +1326,12 @@ async fn disconnect_session_publishes_to_remote_owner() {
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].0, NodeId::from("node-b"));
     assert_eq!(published[0].1.frame_kind, FrameKind::Close);
+    assert_eq!(
+        published[0].1.disconnect_cause,
+        Some(DisconnectCause::ServerRequested {
+            reason: "kicked".into(),
+        })
+    );
     assert!(
         presence
             .locate_session(&SessionId::from("remote-session"))
@@ -865,6 +1402,154 @@ async fn concurrent_accepts_keep_registry_consistent() {
             .len(),
         1
     );
+}
+
+// Concurrent unique-user accepts retain exactly one session 同一用户并发唯一用户接入最终仅保留一条会话
+#[tokio::test]
+async fn concurrent_unique_user_accepts_retain_one_session() {
+    let wing = RustWing::new(
+        RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::UniqueUser),
+    );
+    let identities = (0..32)
+        .map(|_| Identity::default_connection("alice"))
+        .collect();
+
+    let accepted = accept_identities_concurrently(wing.clone(), identities).await;
+    let sessions = wing.list_user_sessions(&UserId::from("alice")).unwrap();
+
+    assert_eq!(wing.connection_count().unwrap(), 1);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        accepted
+            .iter()
+            .filter(|accepted| !accepted.session.is_closed())
+            .count(),
+        1
+    );
+}
+
+// Concurrent unique-client accepts retain one session per client 同一用户并发唯一客户端接入最终每个客户端保留一条会话
+#[tokio::test]
+async fn concurrent_unique_client_accepts_retain_one_session_per_client() {
+    let wing = RustWing::new(
+        RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::UniqueClient),
+    );
+    let identities = (0..32)
+        .map(|index| {
+            Identity::default_connection("alice").with_client(if index % 2 == 0 {
+                "phone"
+            } else {
+                "browser"
+            })
+        })
+        .collect();
+
+    let accepted = accept_identities_concurrently(wing.clone(), identities).await;
+    let sessions = wing.list_user_sessions(&UserId::from("alice")).unwrap();
+
+    assert_eq!(wing.connection_count().unwrap(), 2);
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.client_id.as_ref().map(ClientId::as_str) == Some("phone"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.client_id.as_ref().map(ClientId::as_str) == Some("browser"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        accepted
+            .iter()
+            .filter(|accepted| !accepted.session.is_closed())
+            .count(),
+        2
+    );
+}
+
+// Concurrent multi-session accepts retain every session 同一用户并发多会话接入会保留全部会话
+#[tokio::test]
+async fn concurrent_multi_session_accepts_retain_every_session() {
+    let wing = RustWing::new(
+        RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::MultiSession),
+    );
+    let identities = (0..32)
+        .map(|_| Identity::default_connection("alice"))
+        .collect();
+
+    let accepted = accept_identities_concurrently(wing.clone(), identities).await;
+
+    assert_eq!(wing.connection_count().unwrap(), 32);
+    assert_eq!(
+        wing.list_user_sessions(&UserId::from("alice"))
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(
+        accepted
+            .iter()
+            .all(|accepted| !accepted.session.is_closed())
+    );
+}
+
+// Concurrent accepts and unregisters preserve primary and reverse indexes 同一用户并发接入与注销会保持主索引和反向索引一致
+#[tokio::test]
+async fn concurrent_accepts_and_unregisters_keep_user_indexes_consistent() {
+    let wing = RustWing::new(
+        RustWingConfig::default().with_default_connection_policy(ConnectionPolicy::MultiSession),
+    );
+    let initial = accept_identities_concurrently(
+        wing.clone(),
+        (0..32)
+            .map(|_| Identity::default_connection("alice"))
+            .collect(),
+    )
+    .await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut unregister_tasks = Vec::new();
+    let mut accept_tasks = Vec::new();
+
+    for accepted in initial.iter().take(16) {
+        let wing = wing.clone();
+        let session = accepted.session.clone();
+        let barrier = barrier.clone();
+        unregister_tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            wing.unregister(&session).await.unwrap();
+        }));
+    }
+    for _ in 0..16 {
+        let wing = wing.clone();
+        let barrier = barrier.clone();
+        accept_tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            wing.accept_user("alice").await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    for task in unregister_tasks {
+        task.await.unwrap();
+    }
+    let mut newly_accepted = Vec::new();
+    for task in accept_tasks {
+        newly_accepted.push(task.await.unwrap());
+    }
+
+    let sessions = wing.list_user_sessions(&UserId::from("alice")).unwrap();
+    let report = wing
+        .send_to_user("alice", OutboundFrame::text("index check"))
+        .await
+        .unwrap();
+    assert_eq!(wing.connection_count().unwrap(), 32);
+    assert_eq!(sessions.len(), 32);
+    assert_eq!(report.local_sessions, 32);
+    assert_eq!(newly_accepted.len(), 16);
 }
 
 // Local sessions are preferred before cluster routing 集群路由前优先使用本地会话
@@ -1578,10 +2263,10 @@ async fn send_to_user_counts_remote_nodes() {
     assert_eq!(published.lock().unwrap().len(), 2);
 }
 
-// Failed presence registration rolls back the accepted session 在线状态注册失败会回滚已接收的会话
+// Failed presence claim rolls back the accepted session 在线状态仲裁失败会回滚已接收的会话
 #[tokio::test]
-async fn accept_rolls_back_when_presence_registration_fails() {
-    // Build a clustered manager whose presence store rejects registration 构建在线状态注册会失败的集群管理器
+async fn accept_rolls_back_when_presence_claim_fails() {
+    // Build a clustered manager whose presence store rejects claims 构建在线状态仲裁会失败的集群管理器
     let cluster = Cluster::new(FailingPresenceStore, RecordingPublisher::default());
     let wing = RustWing::with_cluster_checked(
         RustWingConfig {
@@ -1596,11 +2281,11 @@ async fn accept_rolls_back_when_presence_registration_fails() {
     .await
     .unwrap();
 
-    // Accepting the session must surface the registration error 接收会话必须返回注册错误
+    // Accepting the session must surface the claim error 接收会话必须返回仲裁错误
     let result = wing.accept(Identity::new("default", "alice")).await;
 
     // Confirm the failed accept did not leave a local session behind 确认失败的接收不会留下本地会话
-    assert!(matches!(result, Err(RustWingError::Cluster(message)) if message == "register failed"));
+    assert!(matches!(result, Err(RustWingError::Cluster(message)) if message == "claim failed"));
     assert_eq!(wing.connection_count().unwrap(), 0);
     assert!(
         wing.list_user_sessions(&UserId::from("alice"))
@@ -1841,6 +2526,46 @@ async fn wait_for_connection_count_at_most(
     }
 }
 
+// Start identity accepts at one barrier to exercise same-user races 通过同一屏障启动身份接入以制造同用户竞争
+async fn accept_identities_concurrently(
+    wing: RustWing,
+    identities: Vec<Identity>,
+) -> Vec<AcceptedSession> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(identities.len() + 1));
+    let mut tasks = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let wing = wing.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            wing.accept(identity).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+
+    let mut accepted = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        accepted.push(task.await.unwrap());
+    }
+    accepted
+}
+
+// Wait until the runtime reaches the expected lifecycle status 等待运行时到达预期生命周期状态
+async fn wait_for_runtime_status(
+    wing: &RustWing,
+    expected: RuntimeStatus,
+    timeout: Duration,
+) -> RuntimeStatus {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let status = wing.runtime_status();
+        if status == expected || tokio::time::Instant::now() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 // Presence store that fails new route registration 新路由注册会失败的在线状态存储
 struct FailingPresenceStore;
 
@@ -1849,6 +2574,16 @@ impl PresenceStore for FailingPresenceStore {
     // Reject route registration for rollback tests 为回滚测试拒绝路由注册
     async fn register(&self, _route: Route, _ttl: Duration) -> Result<()> {
         Err(RustWingError::Cluster("register failed".into()))
+    }
+
+    // Reject route claims for rollback tests 为回滚测试拒绝路由仲裁
+    async fn claim(
+        &self,
+        _route: Route,
+        _policy: ConnectionPolicy,
+        _ttl: Duration,
+    ) -> Result<RouteClaim> {
+        Err(RustWingError::Cluster("claim failed".into()))
     }
 
     // Remove succeeds because no route is stored 没有存储路由所以删除成功
@@ -1868,8 +2603,8 @@ impl PresenceStore for FailingPresenceStore {
         _user_id: &UserId,
         _session_id: &SessionId,
         _ttl: Duration,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<RouteRefresh> {
+        Ok(RouteRefresh::Lost)
     }
 
     // Locate returns no routes because registration always fails 注册总是失败所以查询不到路由
@@ -1922,6 +2657,8 @@ impl PresenceStore for FailingPresenceStore {
 struct SharedPresenceStore {
     // Shared in-memory presence implementation 共享内存在线状态实现
     inner: Arc<MemoryPresenceStore>,
+    // Whether node registration should fail 节点注册是否应失败
+    fail_node_registration: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -1929,6 +2666,16 @@ impl PresenceStore for SharedPresenceStore {
     // Register a route through the shared store 通过共享存储注册路由
     async fn register(&self, route: Route, ttl: Duration) -> Result<()> {
         self.inner.register(route, ttl).await
+    }
+
+    // Claim a route through the shared store 通过共享存储原子仲裁路由
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim> {
+        self.inner.claim(route, policy, ttl).await
     }
 
     // Remove a route through the shared store 通过共享存储删除路由
@@ -1950,7 +2697,7 @@ impl PresenceStore for SharedPresenceStore {
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<RouteRefresh> {
         self.inner
             .touch(connection_type, user_id, session_id, ttl)
             .await
@@ -1992,6 +2739,11 @@ impl PresenceStore for SharedPresenceStore {
         instance_id: &str,
         ttl: Duration,
     ) -> Result<NodeLease> {
+        if self.fail_node_registration.load(Ordering::Acquire) {
+            return Err(RustWingError::Cluster(
+                "test node lease refresh failed".into(),
+            ));
+        }
         self.inner.register_node(node_id, instance_id, ttl).await
     }
 

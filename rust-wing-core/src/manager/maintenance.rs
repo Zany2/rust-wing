@@ -5,9 +5,11 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::error::Result;
+use crate::lifecycle::DisconnectCause;
 use crate::protocol::OutboundFrame;
 use crate::session::Session;
 
+use super::delivery::enqueue_failure_cause;
 use super::{Inner, RustWing};
 
 impl RustWing {
@@ -21,14 +23,19 @@ impl RustWing {
             return;
         }
         let (maintenance_stop, stop_rx) = watch::channel(false);
-        {
-            let Some(inner) = Arc::get_mut(&mut self.inner) else {
-                return;
-            };
-            inner.maintenance_stop = Some(maintenance_stop);
-        }
+        *self
+            .inner
+            .maintenance_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(maintenance_stop);
         let task_inner = Arc::downgrade(&self.inner);
-        spawn_maintenance_task(task_inner, stop_rx);
+        self.inner.runtime.set_maintenance_running(true);
+        let task = spawn_maintenance_task(task_inner, stop_rx);
+        *self
+            .inner
+            .maintenance_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(task);
     }
 }
 
@@ -63,6 +70,9 @@ fn spawn_maintenance_task(
                 }
             }
         }
+        if let Some(inner) = inner.upgrade() {
+            inner.runtime.set_maintenance_running(false);
+        }
     })
 }
 
@@ -75,7 +85,8 @@ impl RustWing {
             .filter(|session| session.is_inactive(self.inner.config.heartbeat_timeout))
             .collect::<Vec<_>>();
         for session in &inactive {
-            self.unregister(session).await?;
+            self.unregister_with_cause(session, DisconnectCause::HeartbeatTimeout)
+                .await?;
         }
         Ok(inactive.len())
     }
@@ -109,12 +120,12 @@ impl RustWing {
                 continue;
             }
             probed += 1;
-            if self.send_liveness_probe(&session).is_err() {
+            if let Err(error) = self.send_liveness_probe(&session) {
                 if removed >= max_cleanup {
                     continue;
                 }
                 if self
-                    .remove_confirmed_inactive_session(&session, false)
+                    .unregister_with_cause(&session, enqueue_failure_cause(&error))
                     .await?
                 {
                     removed += 1;
@@ -171,7 +182,7 @@ impl RustWing {
         {
             return Ok(false);
         }
-        self.unregister(&current).await?;
-        Ok(true)
+        self.unregister_with_cause(&current, DisconnectCause::HeartbeatTimeout)
+            .await
     }
 }

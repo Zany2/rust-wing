@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rust_wing_core::{
-    ConnectionType, NodeId, NodeLease, Result, Route, RustWingError, SessionId, UserId,
+    ConnectionPolicy, ConnectionType, NodeId, NodeLease, Result, Route, RouteClaim, RouteRefresh,
+    RustWingError, SessionId, UserId,
 };
 
 use crate::PresenceStoreAdapter;
@@ -73,6 +74,51 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
         Ok(())
     }
 
+    // Claim one route and remove policy-conflicting owners atomically 原子注册路由并移除与策略冲突的所有者
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim> {
+        let now = Instant::now();
+        let live_nodes = self.live_node_ids(now)?;
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| RustWingError::Cluster("presence adapter lock poisoned".into()))?;
+        let key = PresenceKey::from_route(&route);
+        let entries = routes.entry(key).or_default();
+        entries
+            .retain(|_, entry| entry.expires_at > now && live_nodes.contains(&entry.route.node_id));
+        let displaced_ids = entries
+            .iter()
+            .filter_map(|(session_id, entry)| {
+                if session_id == &route.session_id {
+                    return None;
+                }
+                let displaced = match policy {
+                    ConnectionPolicy::UniqueUser => true,
+                    ConnectionPolicy::UniqueClient => entry.route.client_id == route.client_id,
+                    ConnectionPolicy::MultiSession => false,
+                };
+                displaced.then(|| session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let displaced = displaced_ids
+            .into_iter()
+            .filter_map(|session_id| entries.remove(&session_id).map(|entry| entry.route))
+            .collect();
+        entries.insert(
+            route.session_id.clone(),
+            MemoryRoute {
+                route,
+                expires_at: now + ttl,
+            },
+        );
+        Ok(RouteClaim { displaced })
+    }
+
     // Remove one exact connection-user-session route 删除指定连接体系用户会话路由
     async fn remove(
         &self,
@@ -104,7 +150,9 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<RouteRefresh> {
+        let now = Instant::now();
+        let live_nodes = self.live_node_ids(now)?;
         // Acquire exclusive access before refreshing routes 刷新路由前获取独占访问
         let mut routes = self
             .routes
@@ -112,12 +160,25 @@ impl PresenceStoreAdapter for MemoryPresenceAdapter {
             .map_err(|_| RustWingError::Cluster("presence adapter lock poisoned".into()))?;
         // Refresh only the matching live route 只刷新匹配的活跃路由
         let key = PresenceKey::new(connection_type.clone(), user_id.clone());
+        let mut refreshed = false;
         if let Some(entries) = routes.get_mut(&key) {
             if let Some(entry) = entries.get_mut(session_id) {
-                entry.expires_at = Instant::now() + ttl;
+                if entry.expires_at > now && live_nodes.contains(&entry.route.node_id) {
+                    entry.expires_at = now + ttl;
+                    refreshed = true;
+                } else {
+                    entries.remove(session_id);
+                }
             }
         }
-        Ok(())
+        if routes.get(&key).is_some_and(HashMap::is_empty) {
+            routes.remove(&key);
+        }
+        Ok(if refreshed {
+            RouteRefresh::Refreshed
+        } else {
+            RouteRefresh::Lost
+        })
     }
 
     // Read current non-expired routes 读取当前未过期路由

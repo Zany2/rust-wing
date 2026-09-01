@@ -1,25 +1,31 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+use tokio::task::JoinHandle;
 
 use crate::cluster::Cluster;
 use crate::config::RustWingConfig;
 use crate::error::{Result, RustWingError};
 use crate::identity::{Identity, UserId};
+use crate::lifecycle::{DisconnectCause, SessionEvent};
 use crate::protocol::HeartbeatAckData;
 use crate::session::{AcceptedSession, Session};
 
 mod delivery;
 mod disconnect;
+mod events;
 mod maintenance;
 mod presence;
 mod query;
 mod registry;
+mod runtime;
 mod stats;
 
 use presence::generate_instance_id;
 use registry::Registry;
+use runtime::RuntimeState;
+pub use runtime::{RuntimeHealth, RuntimeStatus};
 use stats::RuntimeStats;
 pub use stats::StatsSnapshot;
 
@@ -38,6 +44,8 @@ pub(super) struct Inner {
     cluster: Option<Cluster>,
     // Local session registry 本地会话注册表
     registry: Registry,
+    // Non-blocking session lifecycle event channel 非阻塞会话生命周期事件通道
+    session_events: broadcast::Sender<SessionEvent>,
     // Runtime counters for lightweight observability 轻量可观测性使用的运行计数器
     stats: RuntimeStats,
     // Cursor used to shard maintenance scans 维护分片扫描使用的游标
@@ -45,9 +53,17 @@ pub(super) struct Inner {
     // Runtime instance identifier used for node lease ownership 用于节点租约归属的运行实例标识
     instance_id: String,
     // Stop signal for the background node lease refresher 节点租约后台刷新任务的停止信号
-    lease_stop: Option<watch::Sender<bool>>,
+    lease_stop: Mutex<Option<watch::Sender<bool>>>,
+    // Managed node lease refresher task 托管的节点租约刷新任务
+    lease_task: Mutex<Option<JoinHandle<()>>>,
     // Stop signal for the background maintenance task 后台维护任务的停止信号
-    maintenance_stop: Option<watch::Sender<bool>>,
+    maintenance_stop: Mutex<Option<watch::Sender<bool>>>,
+    // Managed session maintenance task 托管的会话维护任务
+    maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    // Shared runtime lifecycle and health state 共享运行时生命周期与健康状态
+    runtime: RuntimeState,
+    // Serialize repeated shutdown requests 串行化重复关闭请求
+    shutdown_lock: tokio::sync::Mutex<()>,
 }
 
 // Delivery result split by local and remote routing 本地与远程路由拆分后的投递结果
@@ -78,6 +94,7 @@ impl RustWing {
     pub fn new(config: RustWingConfig) -> Self {
         let mut wing = Self::assemble(config, None);
         wing.start_maintenance();
+        wing.inner.runtime.mark_running();
         wing
     }
 
@@ -88,6 +105,7 @@ impl RustWing {
         if !config.cluster.enabled {
             let mut wing = Self::assemble(config, None);
             wing.start_maintenance();
+            wing.inner.runtime.mark_running();
             return Ok(wing);
         }
 
@@ -98,16 +116,25 @@ impl RustWing {
 
     // Assemble a manager before checked startup 供校验式启动使用的管理器组装方法
     fn assemble(config: RustWingConfig, cluster: Option<Cluster>) -> Self {
+        let config = config.normalized();
+        let cluster_enabled = config.cluster.enabled;
+        let maintenance_enabled = config.maintenance.enabled;
+        let (session_events, _) = broadcast::channel(config.session_event_capacity);
         Self {
             inner: Arc::new(Inner {
-                config: config.normalized(),
+                config,
                 cluster,
                 registry: Registry::default(),
+                session_events,
                 stats: RuntimeStats::default(),
                 maintenance_cursor: AtomicUsize::new(0),
                 instance_id: generate_instance_id(),
-                lease_stop: None,
-                maintenance_stop: None,
+                lease_stop: Mutex::new(None),
+                lease_task: Mutex::new(None),
+                maintenance_stop: Mutex::new(None),
+                maintenance_task: Mutex::new(None),
+                runtime: RuntimeState::new(cluster_enabled, maintenance_enabled),
+                shutdown_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -126,8 +153,10 @@ impl RustWing {
         }
         let mut wing = Self::assemble(config, cluster);
         wing.register_node_lease().await?;
-        wing.start_node_lease_refresher();
+        wing.inner.runtime.mark_node_lease_healthy();
         wing.start_maintenance();
+        wing.inner.runtime.mark_running();
+        wing.start_node_lease_refresher();
         Ok(wing)
     }
 
@@ -138,6 +167,14 @@ impl RustWing {
 
     // Accept a new client session 接收新的客户端会话
     pub async fn accept(&self, identity: Identity) -> Result<AcceptedSession> {
+        self.ensure_accepting()?;
+        let _operation_guard = self
+            .inner
+            .registry
+            .operation_lock(&identity.connection_type, &identity.user_id)
+            .lock()
+            .await;
+        self.ensure_accepting()?;
         let accepted = AcceptedSession::new(
             self.inner.config.node_id.clone(),
             identity,
@@ -146,24 +183,32 @@ impl RustWing {
 
         let replaced = self.insert_session(accepted.session.clone());
         for session in replaced {
-            session.close("replaced by a newer connection");
-            let _ = self.unregister(&session).await;
+            let _ = self
+                .finalize_removed_session(&session, DisconnectCause::Replaced)
+                .await;
         }
 
-        if let Err(error) = self.register_presence(&accepted.session).await {
-            self.inner.registry.remove(&accepted.session);
-            accepted.session.close("presence registration failed");
+        let claim = match self.claim_presence(&accepted.session).await {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.rollback_unaccepted_session(&accepted.session, "presence claim failed")
+                    .await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.close_displaced_cluster_sessions(claim.displaced).await {
+            self.rollback_unaccepted_session(
+                &accepted.session,
+                "cluster session replacement failed",
+            )
+            .await;
             return Err(error);
         }
 
-        if let Err(error) = self
-            .close_displaced_cluster_sessions(&accepted.session)
-            .await
-        {
-            let _ = self.unregister(&accepted.session).await;
-            return Err(error);
-        }
-
+        self.emit_session_event(SessionEvent::Connected {
+            session: accepted.session.snapshot(),
+        });
         Ok(accepted)
     }
 
@@ -184,25 +229,171 @@ impl RustWing {
 
     // Gracefully unregister local sessions and release the node lease 优雅注销本地会话并释放节点租约
     pub async fn shutdown(&self) -> Result<usize> {
-        if let Some(lease_stop) = &self.inner.lease_stop {
+        let _shutdown_guard = self.inner.shutdown_lock.lock().await;
+        if self.runtime_status() == RuntimeStatus::Stopped {
+            return Ok(0);
+        }
+        self.inner.runtime.mark_stopping();
+
+        if let Some(lease_stop) = self
+            .inner
+            .lease_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
             let _ = lease_stop.send(true);
         }
-        if let Some(maintenance_stop) = &self.inner.maintenance_stop {
+        if let Some(maintenance_stop) = self
+            .inner
+            .maintenance_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
             let _ = maintenance_stop.send(true);
+        }
+
+        let lease_task = self
+            .inner
+            .lease_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let maintenance_task = self
+            .inner
+            .maintenance_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let mut first_error = None;
+        if let Some(task) = lease_task {
+            if let Err(error) = task.await {
+                first_error = Some(RustWingError::Cluster(format!(
+                    "node lease task failed: {error}"
+                )));
+            }
+        }
+        if let Some(task) = maintenance_task {
+            if let Err(error) = task.await {
+                if first_error.is_none() {
+                    first_error = Some(RustWingError::Cluster(format!(
+                        "maintenance task failed: {error}"
+                    )));
+                }
+            }
         }
 
         let sessions = self.all_sessions();
         for session in &sessions {
-            self.unregister(session).await?;
+            if let Err(error) = self
+                .unregister_with_cause(session, DisconnectCause::RuntimeShutdown)
+                .await
+            {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        self.unregister_node_lease().await?;
-        Ok(sessions.len())
+        if let Err(error) = self.unregister_node_lease().await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        self.inner.runtime.mark_stopped();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(sessions.len()),
+        }
     }
 
     // Remove one session from local and cluster state 从本地与集群状态中移除一个会话
     pub async fn unregister(&self, session: &Session) -> Result<()> {
-        self.inner.registry.remove(session);
+        self.unregister_with_cause(session, DisconnectCause::Unregistered)
+            .await
+            .map(|_| ())
+    }
 
+    // Remove one session with an explicit lifecycle cause 使用明确生命周期原因移除一条会话
+    pub async fn unregister_with_cause(
+        &self,
+        session: &Session,
+        cause: DisconnectCause,
+    ) -> Result<bool> {
+        let _operation_guard = self
+            .inner
+            .registry
+            .operation_lock(session.connection_type(), session.user_id())
+            .lock()
+            .await;
+        self.unregister_with_cause_unlocked(session, cause).await
+    }
+
+    // Remove one session while its user operation lock is already held 用户操作锁已持有时移除一条会话
+    async fn unregister_with_cause_unlocked(
+        &self,
+        session: &Session,
+        cause: DisconnectCause,
+    ) -> Result<bool> {
+        let Some(removed) = self.inner.registry.remove(session) else {
+            return Ok(false);
+        };
+        self.finalize_removed_session(&removed, cause).await?;
+        Ok(true)
+    }
+
+    async fn finalize_removed_session(
+        &self,
+        session: &Session,
+        cause: DisconnectCause,
+    ) -> Result<()> {
+        let presence_result = self.remove_session_presence(session).await;
+        self.close_removed_session(session, cause);
+        presence_result
+    }
+
+    pub(super) fn remove_local_session_with_cause(
+        &self,
+        session: &Session,
+        cause: DisconnectCause,
+    ) -> bool {
+        let Some(removed) = self.inner.registry.remove(session) else {
+            return false;
+        };
+        self.close_removed_session(&removed, cause);
+        self.spawn_presence_cleanup(removed);
+        true
+    }
+
+    // Schedule distributed route cleanup for synchronous compatibility paths 为同步兼容路径安排分布式路由清理
+    fn spawn_presence_cleanup(&self, session: Session) {
+        if self.inner.cluster.is_none() || !self.inner.config.cluster.enabled {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let wing = self.clone();
+        runtime.spawn(async move {
+            let _ = wing.remove_session_presence(&session).await;
+        });
+    }
+
+    fn close_removed_session(&self, session: &Session, cause: DisconnectCause) {
+        session.close(cause.close_reason());
+        self.emit_session_event(SessionEvent::Disconnected {
+            session: session.snapshot(),
+            cause,
+        });
+    }
+
+    async fn rollback_unaccepted_session(&self, session: &Session, reason: &str) {
+        let _ = self.inner.registry.remove(session);
+        let _ = self.remove_session_presence(session).await;
+        session.close(reason);
+    }
+
+    async fn remove_session_presence(&self, session: &Session) -> Result<()> {
         if let Some(cluster) = &self.inner.cluster {
             if self.inner.config.cluster.enabled {
                 cluster
@@ -211,8 +402,6 @@ impl RustWing {
                     .await?;
             }
         }
-
-        session.close("unregistered");
         Ok(())
     }
 

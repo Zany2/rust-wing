@@ -7,8 +7,8 @@ use rust_wing_adapter::{
     rust_wing_from_adapters,
 };
 use rust_wing_core::{
-    ClusterConfig, ClusterEnvelope, ConnectionType, NodeId, OutboundFrame, Result, Route, RustWing,
-    RustWingConfig, UserId,
+    ClusterConfig, ClusterEnvelope, ConnectionPolicy, ConnectionType, NodeId, OutboundFrame,
+    Result, Route, RouteRefresh, RustWing, RustWingConfig, SessionId, UserId,
 };
 
 // Memory adapter can be bridged into the core cluster 内存适配器可桥接到核心集群
@@ -118,6 +118,71 @@ async fn rust_wing_from_adapters_composes_presence_and_publisher() {
     assert_eq!(report.remote_nodes, 1);
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].0, NodeId::from("node-b"));
+}
+
+// Memory adapter claims displace old owners and reject their refreshes 内存适配器仲裁会替换旧所有者并拒绝其续期
+#[tokio::test]
+async fn memory_adapter_claim_prevents_displaced_route_refresh() {
+    let presence = MemoryPresenceAdapter::new();
+    for node_id in ["node-a", "node-b"] {
+        presence
+            .register_node(
+                &NodeId::from(node_id),
+                &format!("instance-{node_id}"),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+    }
+    let old_route = Route {
+        connection_type: ConnectionType::from("default"),
+        user_id: UserId::from("alice"),
+        client_id: None,
+        session_id: SessionId::from("session-a"),
+        node_id: NodeId::from("node-a"),
+    };
+    let new_route = Route {
+        session_id: SessionId::from("session-b"),
+        node_id: NodeId::from("node-b"),
+        ..old_route.clone()
+    };
+    presence
+        .claim(
+            old_route.clone(),
+            ConnectionPolicy::UniqueUser,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let claim = presence
+        .claim(
+            new_route.clone(),
+            ConnectionPolicy::UniqueUser,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(claim.displaced, vec![old_route.clone()]);
+    assert_eq!(
+        presence
+            .touch(
+                &old_route.connection_type,
+                &old_route.user_id,
+                &old_route.session_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        RouteRefresh::Lost
+    );
+    assert_eq!(
+        presence
+            .locate(&new_route.connection_type, &new_route.user_id)
+            .await
+            .unwrap(),
+        vec![new_route]
+    );
 }
 
 // Test publisher adapter that records envelopes 测试用记录型发布适配器

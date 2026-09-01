@@ -3,6 +3,9 @@ use thiserror::Error;
 // Recoverable runtime errors 可恢复的运行时错误
 #[derive(Debug, Error)]
 pub enum RustWingError {
+    // Runtime lifecycle does not currently allow the requested operation 当前运行时生命周期不允许执行所请求操作
+    #[error("runtime is not ready: {0}")]
+    RuntimeNotReady(String),
     // Session queue cannot accept more frames 会话队列无法接收更多帧
     #[error("session write queue is full")]
     QueueFull,

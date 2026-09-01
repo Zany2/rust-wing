@@ -6,6 +6,8 @@ pub mod config;
 pub mod error;
 // Public identity module 公共身份模块
 pub mod identity;
+// Public lifecycle module 公共生命周期模块
+pub mod lifecycle;
 // Public manager module 公共管理模块
 pub mod manager;
 // Public protocol module 公共协议模块
@@ -16,7 +18,7 @@ pub mod session;
 // Re-export cluster APIs 重导出集群接口
 pub use cluster::{
     Cluster, ClusterEnvelope, ClusterTarget, MemoryPresenceStore, NodeLease, NodePublisher,
-    PresenceStore, Route,
+    PresenceStore, Route, RouteClaim, RouteRefresh,
 };
 // Re-export config APIs 重导出配置接口
 pub use config::{ClusterConfig, ConnectionPolicy, MaintenanceConfig, RustWingConfig};
@@ -24,8 +26,10 @@ pub use config::{ClusterConfig, ConnectionPolicy, MaintenanceConfig, RustWingCon
 pub use error::{Result, RustWingError};
 // Re-export identity APIs 重导出身份接口
 pub use identity::{ClientId, ConnectionType, Identity, NodeId, SessionId, UserId};
+// Re-export lifecycle APIs 重导出生命周期接口
+pub use lifecycle::{DisconnectCause, SessionEvent};
 // Re-export manager API 重导出管理器接口
-pub use manager::{DeliveryReport, RustWing, StatsSnapshot};
+pub use manager::{DeliveryReport, RuntimeHealth, RuntimeStatus, RustWing, StatsSnapshot};
 // Re-export protocol APIs 重导出协议接口
 pub use protocol::{
     FrameKind, HEARTBEAT_EVENT, HeartbeatAckData, HeartbeatData, MessageType, OutboundFrame,

@@ -398,8 +398,45 @@ async fn main() -> rust_wing_core::Result<()> {
 }
 ```
 
-如果应用需要分别控制 Redis key 前缀、频道前缀或订阅任务，也可以继续使用
-`redis_cluster_parts_from_config(...)` 手动组装 cluster 和 subscriber。
+在线路由存储与节点消息传输可以使用不同的基础设施。需要由框架统一管理生命周期时，
+使用 `DistributedRustWing`。它固定使用 Redis 存储 Presence 和 NodeId 租约，同时在
+Redis、NATS、Kafka 中选择一种节点消息传输，并统一启动、关闭对应订阅任务：
+
+```rust
+use rust_wing_adapter::{
+    DistributedRuntimeConfig, DistributedRustWing, NatsPublisherConfig,
+    RedisPresenceConfig,
+};
+use rust_wing_core::RustWingConfig;
+
+# async fn build() -> rust_wing_core::Result<()> {
+let runtime = DistributedRustWing::connect(
+    RustWingConfig::default().with_node_id("node-a"),
+    DistributedRuntimeConfig::new(
+        RedisPresenceConfig::new("redis://127.0.0.1:6379"),
+        NatsPublisherConfig::from_urls([
+            "nats://nats-1:4222",
+            "nats://nats-2:4222",
+        ]),
+    ),
+)
+.await?;
+
+let wing = runtime.wing_clone();
+// 使用 wing 接收 WebSocket 会话并发送消息。
+
+runtime.shutdown().await?;
+# Ok(())
+# }
+```
+
+使用这个例子需要启用 `redis` 和 `nats` feature。把 NATS 配置替换成
+`RedisPublisherConfig` 或 `KafkaPublisherConfig`，即可选择另外两种消息传输；Kafka
+当前只在非 Windows 目标提供真实实现。
+
+如果应用需要分别控制 Redis key 前缀、频道前缀、订阅任务或接入自定义中间件，仍然
+可以使用 `rust_wing_from_adapters(...)` 或 `redis_cluster_parts_from_config(...)`
+手动组装 cluster 和 subscriber。
 
 Redis Presence 和 Redis 节点消息都可以通过 `RedisDeployment` 使用单节点、Cluster
 或 Sentinel 部署：

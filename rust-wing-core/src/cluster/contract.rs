@@ -2,16 +2,25 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::config::ConnectionPolicy;
 use crate::error::Result;
 use crate::identity::{ConnectionType, NodeId, SessionId, UserId};
 
-use super::{ClusterEnvelope, NodeLease, Route};
+use super::{ClusterEnvelope, NodeLease, Route, RouteClaim, RouteRefresh};
 
 // Presence persistence contract 在线状态持久化契约
 #[async_trait]
 pub trait PresenceStore: Send + Sync {
     // Register a route with its lifetime 注册带有效期的路由
     async fn register(&self, route: Route, ttl: Duration) -> Result<()>;
+
+    // Atomically claim a route according to the connection policy 按连接策略原子仲裁并注册路由
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim>;
 
     // Remove one exact route 删除一条精确路由
     async fn remove(
@@ -28,7 +37,7 @@ pub trait PresenceStore: Send + Sync {
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()>;
+    ) -> Result<RouteRefresh>;
 
     // Locate every current route for a user 查询用户当前全部路由
     async fn locate(

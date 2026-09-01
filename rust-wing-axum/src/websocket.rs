@@ -5,8 +5,8 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use rust_wing_core::{
-    FrameKind, HEARTBEAT_EVENT, HeartbeatData, Identity, MessageType, OutboundFrame, Result,
-    RustWing, Session, WsMessage, now_millis,
+    DisconnectCause, FrameKind, HEARTBEAT_EVENT, HeartbeatData, Identity, MessageType,
+    OutboundFrame, Result, RustWing, RustWingError, Session, WsMessage, now_millis,
 };
 use tokio::task::JoinHandle;
 
@@ -108,10 +108,46 @@ where
     let (mut sender, mut receiver) = socket.split();
 
     // Forward RustWing outbound frames to the WebSocket writer 将 RustWing 出站帧转发到 WebSocket 写端
+    let mut close_signal = session.subscribe_close();
     let outbound_task = tokio::spawn(async move {
-        while let Some(frame) = outbound.recv().await {
-            if sender.send(axum_message_from_frame(frame)).await.is_err() {
-                break;
+        loop {
+            let pending_close = { close_signal.borrow_and_update().clone() };
+            if let Some(reason) = pending_close {
+                let reason = String::from_utf8_lossy(&reason).into_owned();
+                let close = OutboundFrame::close(reason.clone());
+                if sender.send(axum_message_from_frame(close)).await.is_err() {
+                    return DisconnectCause::TransportError {
+                        message: "websocket close write failed".into(),
+                    };
+                }
+                return DisconnectCause::ServerRequested { reason };
+            }
+            tokio::select! {
+                biased;
+                changed = close_signal.changed() => {
+                    if changed.is_err() {
+                        return DisconnectCause::TransportError {
+                            message: "session close signal closed".into(),
+                        };
+                    }
+                }
+                frame = outbound.recv() => {
+                    let Some(frame) = frame else {
+                        return DisconnectCause::TransportError {
+                            message: "session outbound queue closed".into(),
+                        };
+                    };
+                    let close_reason = (frame.kind == FrameKind::Close)
+                        .then(|| String::from_utf8_lossy(&frame.payload).into_owned());
+                    if sender.send(axum_message_from_frame(frame)).await.is_err() {
+                        return DisconnectCause::TransportError {
+                            message: "websocket write failed".into(),
+                        };
+                    }
+                    if let Some(reason) = close_reason {
+                        return DisconnectCause::ServerRequested { reason };
+                    }
+                }
             }
         }
     });
@@ -127,46 +163,103 @@ where
             session: inbound_session,
         };
 
-        while let Some(message) = receiver.next().await {
-            let Ok(message) = message else {
-                break;
+        loop {
+            let message = match receiver.next().await {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => {
+                    return DisconnectCause::TransportError {
+                        message: error.to_string(),
+                    };
+                }
+                None => {
+                    return DisconnectCause::ClientClosed {
+                        code: None,
+                        reason: None,
+                    };
+                }
             };
+            if let Message::Close(frame) = message {
+                return client_close_cause(frame);
+            }
             match handle_inbound_message(context.clone(), inbound_handler.as_ref(), message).await {
                 Ok(true) => {}
-                Ok(false) | Err(_) => break,
+                Ok(false) => {
+                    return DisconnectCause::ClientClosed {
+                        code: None,
+                        reason: None,
+                    };
+                }
+                Err(error) => {
+                    return inbound_error_cause(error);
+                }
             }
         }
     });
 
     // Stop when either task finishes so disconnect cleanup happens promptly 任意任务结束后立即做断开清理
-    wait_for_socket_tasks(outbound_task, inbound_task).await;
+    let cause = wait_for_socket_tasks(outbound_task, inbound_task).await;
 
-    let _ = wing.unregister(&session).await;
+    let _ = wing.unregister_with_cause(&session, cause).await;
 }
 
-// Wait until one socket task exits and cancel the remaining task 等待一个 socket 任务退出并取消剩余任务
+// Wait until one socket task exits, preserve its cause, and cancel the remaining task 等待一个 socket 任务退出并保留原因后取消剩余任务
 pub(crate) async fn wait_for_socket_tasks(
-    mut outbound_task: JoinHandle<()>,
-    mut inbound_task: JoinHandle<()>,
-) {
+    mut outbound_task: JoinHandle<DisconnectCause>,
+    mut inbound_task: JoinHandle<DisconnectCause>,
+) -> DisconnectCause {
     tokio::select! {
         result = &mut outbound_task => {
             // The writer ended first, so stop the reader promptly 写端先结束时立即停止读端
-            let _ = result;
             abort_and_wait(inbound_task).await;
+            socket_task_cause(result, "websocket writer task failed")
         }
         result = &mut inbound_task => {
             // The reader ended first, so stop the writer promptly 读端先结束时立即停止写端
-            let _ = result;
             abort_and_wait(outbound_task).await;
+            socket_task_cause(result, "websocket reader task failed")
         }
     }
 }
 
+// Convert one WebSocket task result into a disconnect cause 将 WebSocket 任务结果转换为断开原因
+fn socket_task_cause(
+    result: std::result::Result<DisconnectCause, tokio::task::JoinError>,
+    context: &str,
+) -> DisconnectCause {
+    result.unwrap_or_else(|error| DisconnectCause::TransportError {
+        message: format!("{context}: {error}"),
+    })
+}
+
 // Abort a socket task and observe its cancellation 取消 socket 任务并等待其完成取消
-async fn abort_and_wait(task: JoinHandle<()>) {
+async fn abort_and_wait<T>(task: JoinHandle<T>) {
     task.abort();
     let _ = task.await;
+}
+
+// Convert an Axum close frame into a typed client cause 将 Axum 关闭帧转换为类型化客户端原因
+fn client_close_cause(frame: Option<CloseFrame>) -> DisconnectCause {
+    match frame {
+        Some(frame) => DisconnectCause::ClientClosed {
+            code: Some(frame.code),
+            reason: (!frame.reason.is_empty()).then(|| frame.reason.to_string()),
+        },
+        None => DisconnectCause::ClientClosed {
+            code: None,
+            reason: None,
+        },
+    }
+}
+
+// Preserve typed queue failures raised while handling inbound messages 保留入站消息处理期间产生的类型化队列失败
+fn inbound_error_cause(error: RustWingError) -> DisconnectCause {
+    match error {
+        RustWingError::QueueFull => DisconnectCause::OutboundQueueFull,
+        RustWingError::SessionClosed => DisconnectCause::OutboundReceiverClosed,
+        error => DisconnectCause::ApplicationError {
+            message: error.to_string(),
+        },
+    }
 }
 
 // Handle one inbound Axum WebSocket message 处理一条入站 Axum WebSocket 消息

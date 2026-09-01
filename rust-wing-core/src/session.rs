@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::mpsc;
+use serde::Serialize;
+use tokio::sync::{mpsc, watch};
 
 use crate::error::{Result, RustWingError};
 use crate::identity::{ClientId, ConnectionType, Identity, NodeId, SessionId, UserId};
@@ -40,6 +41,8 @@ struct SessionInner {
     probe_pending: AtomicBool,
     // Closed-state flag 关闭状态标记
     closed: AtomicBool,
+    // Close reason signal independent from the bounded frame queue 独立于有界帧队列的关闭原因信号
+    close_signal: watch::Sender<Option<Vec<u8>>>,
 }
 
 // New session plus its outbound receiver 新会话及其出站接收端
@@ -52,7 +55,7 @@ pub struct AcceptedSession {
 }
 
 // Immutable session view 不可变会话视图
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionSnapshot {
     // Session identifier 会话标识
     pub id: SessionId,
@@ -85,6 +88,8 @@ impl AcceptedSession {
     pub(crate) fn new(node_id: NodeId, identity: Identity, capacity: usize) -> Self {
         // Allocate the bounded channel used by writers 分配写端使用的有界通道
         let (sender, outbound) = mpsc::channel(capacity);
+        // Keep close notifications deliverable even when the frame queue is full 即使帧队列已满也保持关闭通知可投递
+        let (close_signal, _) = watch::channel(None);
         // Capture the initial activity timestamp 记录初始活跃时间戳
         let now = now_millis();
         // Assemble the shared session state 组装共享会话状态
@@ -101,6 +106,7 @@ impl AcceptedSession {
                 last_probe_time: AtomicI64::new(0),
                 probe_pending: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                close_signal,
             }),
         };
 
@@ -176,13 +182,11 @@ impl Session {
         match self.inner.sender.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                // A full queue means the peer is not keeping up 队列已满说明对端处理不过来
-                self.close("write queue full");
+                // Let the owning manager decide how to terminate the session 由所属管理器决定如何终止会话
                 Err(RustWingError::QueueFull)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Mirror receiver shutdown into session state 将接收端关闭同步到会话状态
-                self.close("receiver closed");
+                // Report receiver loss without mutating lifecycle ownership 报告接收端丢失且不越权修改生命周期
                 Err(RustWingError::SessionClosed)
             }
         }
@@ -193,8 +197,18 @@ impl Session {
         // Only the first closer emits a close frame 仅首次关闭者发送关闭帧
         let already_closed = self.inner.closed.swap(true, Ordering::AcqRel);
         if !already_closed {
-            let _ = self.inner.sender.try_send(OutboundFrame::close(reason));
+            let reason = reason.into();
+            let _ = self
+                .inner
+                .sender
+                .try_send(OutboundFrame::close(reason.clone()));
+            self.inner.close_signal.send_replace(Some(reason));
         }
+    }
+
+    // Subscribe to a close reason that cannot be blocked by frame backpressure 订阅不会被帧背压阻塞的关闭原因
+    pub fn subscribe_close(&self) -> watch::Receiver<Option<Vec<u8>>> {
+        self.inner.close_signal.subscribe()
     }
 
     // Read the current closed state 读取当前关闭状态

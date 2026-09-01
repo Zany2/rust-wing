@@ -1,10 +1,13 @@
-#[cfg(any(not(windows), test))]
-use rust_wing_core::NodeId;
-use rust_wing_core::{Result, RustWingError};
+use async_trait::async_trait;
+use rust_wing_core::{NodeId, Result, RustWing, RustWingError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::messaging::ExternalMessageConsumerStats;
+use crate::{
+    ManagedNodeSubscriber, NodeSubscriberAdapter, NodeSubscriberStats, NodeSubscriberStatsSnapshot,
+    NodeSubscriberStatus,
+};
 
 // Kafka node message transport configuration Kafka 节点消息传输配置
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +26,10 @@ pub struct KafkaNodeSubscriberHandle {
     stop: watch::Sender<bool>,
     // Background subscriber task 后台订阅任务
     task: JoinHandle<Result<()>>,
+    // Latest subscriber lifecycle state 最新订阅器生命周期状态
+    status: watch::Receiver<NodeSubscriberStatus>,
+    // Shared subscriber counters 共享的订阅器计数器
+    stats: NodeSubscriberStats,
 }
 
 // Kafka external message consumer configuration Kafka 外部消息消费者配置
@@ -82,6 +89,16 @@ impl KafkaPublisherConfig {
 }
 
 impl KafkaNodeSubscriberHandle {
+    // Return the latest subscriber lifecycle state 返回最新的订阅器生命周期状态
+    pub fn status(&self) -> NodeSubscriberStatus {
+        self.status.borrow().clone()
+    }
+
+    // Return a point-in-time subscriber counter snapshot 返回订阅器计数器的时间点快照
+    pub fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     // Ask the subscriber task to stop and wait for it 请求订阅任务停止并等待结束
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(true);
@@ -146,8 +163,8 @@ mod platform {
         KafkaNodeSubscriberHandle, KafkaPublisherConfig, kafka_node_consumer_group,
         kafka_node_topic,
     };
-    use crate::NodePublisherAdapter;
     use crate::messaging::{ExternalMessageConsumerStats, process_external_message_payload};
+    use crate::{NodePublisherAdapter, NodeSubscriberStats, NodeSubscriberStatus};
 
     // Kafka-backed node publisher adapter Kafka 节点消息发布适配器
     #[derive(Clone)]
@@ -234,8 +251,21 @@ mod platform {
         ) -> Result<KafkaNodeSubscriberHandle> {
             let consumer = self.consumer_for_node(&node_id)?;
             let (stop, stop_rx) = watch::channel(false);
-            let task = tokio::spawn(consume_node_topic(consumer, wing, stop_rx));
-            Ok(KafkaNodeSubscriberHandle { stop, task })
+            let (status_tx, status) = watch::channel(NodeSubscriberStatus::Running);
+            let stats = NodeSubscriberStats::default();
+            let task = tokio::spawn(consume_node_topic(
+                consumer,
+                wing,
+                stop_rx,
+                status_tx,
+                stats.clone(),
+            ));
+            Ok(KafkaNodeSubscriberHandle {
+                stop,
+                task,
+                status,
+                stats,
+            })
         }
 
         // Consume messages until the consumer stream ends or a stop signal arrives 消费消息直到消费流结束或收到停止信号
@@ -246,7 +276,15 @@ mod platform {
             stop_rx: watch::Receiver<bool>,
         ) -> Result<()> {
             let consumer = self.consumer_for_node(&node_id)?;
-            consume_node_topic(consumer, wing, stop_rx).await
+            let (status_tx, _status_rx) = watch::channel(NodeSubscriberStatus::Running);
+            consume_node_topic(
+                consumer,
+                wing,
+                stop_rx,
+                status_tx,
+                NodeSubscriberStats::default(),
+            )
+            .await
         }
 
         // Create a consumer dedicated to one node topic 创建专用于单个节点主题的消费者
@@ -273,33 +311,53 @@ mod platform {
         consumer: StreamConsumer,
         wing: RustWing,
         mut stop_rx: watch::Receiver<bool>,
+        status: watch::Sender<NodeSubscriberStatus>,
+        stats: NodeSubscriberStats,
     ) -> Result<()> {
         let mut stream = consumer.stream();
         loop {
             tokio::select! {
                 message = stream.next() => {
                     let Some(message) = message else {
-                        break;
+                        stats.record_consume_failed();
+                        let error = RustWingError::Cluster("kafka node consumer stream ended".into());
+                        let _ = status.send(NodeSubscriberStatus::Failed(error.to_string()));
+                        return Err(error);
                     };
-                    let Ok(message) = message else {
-                        continue;
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(_) => {
+                            stats.record_consume_failed();
+                            continue;
+                        }
                     };
-                    let Some(payload) = message.payload() else {
-                        continue;
+                    stats.record_received();
+                    let payload = match message.payload() {
+                        Some(payload) => payload,
+                        None => {
+                            stats.record_decode_failed();
+                            continue;
+                        }
                     };
-                    let Ok(envelope) = serde_json::from_slice::<ClusterEnvelope>(payload) else {
-                        continue;
+                    let envelope = match serde_json::from_slice::<ClusterEnvelope>(payload) {
+                        Ok(envelope) => envelope,
+                        Err(_) => {
+                            stats.record_decode_failed();
+                            continue;
+                        }
                     };
-                    let _ = wing.handle_cluster_envelope(envelope);
+                    if wing.handle_cluster_envelope_async(envelope).await.is_err() {
+                        stats.record_delivery_failed();
+                    }
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
-                        break;
+                        let _ = status.send(NodeSubscriberStatus::Stopped);
+                        return Ok(());
                     }
                 }
             }
         }
-        Ok(())
     }
 
     // Spawn a Kafka consumer that delivers ExternalMessage JSON through RustWing 启动通过 RustWing 投递 ExternalMessage JSON 的 Kafka 消费者
@@ -436,6 +494,33 @@ mod platform {
 pub use platform::{
     KafkaNodePublisherAdapter, KafkaNodeSubscriberAdapter, spawn_kafka_external_message_consumer,
 };
+
+#[async_trait]
+impl NodeSubscriberAdapter for KafkaNodeSubscriberAdapter {
+    async fn start_for_node(
+        &self,
+        node_id: NodeId,
+        wing: RustWing,
+    ) -> Result<Box<dyn ManagedNodeSubscriber>> {
+        self.spawn_for_node(node_id, wing)
+            .map(|subscriber| Box::new(subscriber) as Box<dyn ManagedNodeSubscriber>)
+    }
+}
+
+#[async_trait]
+impl ManagedNodeSubscriber for KafkaNodeSubscriberHandle {
+    fn status(&self) -> NodeSubscriberStatus {
+        KafkaNodeSubscriberHandle::status(self)
+    }
+
+    fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        KafkaNodeSubscriberHandle::stats(self)
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<()> {
+        KafkaNodeSubscriberHandle::shutdown(*self).await
+    }
+}
 
 // Build the exact Kafka topic for one node 构建单个节点的精确 Kafka 主题
 #[cfg(any(not(windows), test))]

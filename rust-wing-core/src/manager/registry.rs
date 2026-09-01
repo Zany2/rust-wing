@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, MutexGuard};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -7,8 +10,10 @@ use crate::config::{ConnectionPolicy, RustWingConfig};
 use crate::identity::{ClientId, ConnectionType, SessionId, UserId};
 use crate::session::Session;
 
+// Fixed user-lock shard count keeps coordination bounded 固定用户锁分片数量以保持协调资源有界
+const USER_LOCK_SHARDS: usize = 128;
+
 // Local indexes for active sessions 活跃会话的本地索引
-#[derive(Default)]
 pub(super) struct Registry {
     // Direct session lookup by id 按会话标识直接查找
     pub(super) by_session: DashMap<SessionId, Session>,
@@ -16,6 +21,10 @@ pub(super) struct Registry {
     by_user: DashMap<UserRouteKey, HashSet<SessionId>>,
     // Reverse index from connection-user-client triples to session ids 连接体系用户客户端组合到会话标识的反向索引
     by_client: DashMap<ClientRouteKey, HashSet<SessionId>>,
+    // Short critical sections protecting all indexes for one user 保护单个用户全部索引的短临界区
+    mutation_locks: Box<[Mutex<()>]>,
+    // Async operations serialized for one user 同一用户串行化的异步操作
+    operation_locks: Box<[tokio::sync::Mutex<()>]>,
 }
 
 // User routing key scoped by connection system 按连接体系隔离的用户路由键
@@ -39,20 +48,30 @@ pub(super) struct ClientRouteKey {
 }
 
 impl Registry {
+    // Return the async operation lock assigned to one connection-user key 返回连接体系用户键对应的异步操作锁
+    pub(super) fn operation_lock(
+        &self,
+        connection_type: &ConnectionType,
+        user_id: &UserId,
+    ) -> &tokio::sync::Mutex<()> {
+        &self.operation_locks[user_lock_index(connection_type, user_id)]
+    }
+
     // Insert a session and optionally replace existing user sessions 插入会话并按需替换用户旧会话
     pub(super) fn insert(&self, session: Session, config: &RustWingConfig) -> Vec<Session> {
+        let _mutation_guard = self.mutation_guard(session.connection_type(), session.user_id());
         let user_key = UserRouteKey::from_session(&session);
         let session_id = session.id().clone();
         let client_key = ClientRouteKey::from_session(&session);
         let policy = config.policy_for(session.connection_type());
 
-        // Update one user's reverse index under the DashMap shard guard 在 DashMap 分片保护下更新单个用户反向索引
+        // Select displaced ids while the user mutation lock is held 在用户变更锁保护下选择被替换标识
         let replaced_ids = match policy {
             ConnectionPolicy::UniqueUser => self.session_ids_for_user_key(&user_key),
             ConnectionPolicy::UniqueClient => self.session_ids_for_client_key(&client_key),
             ConnectionPolicy::MultiSession => Vec::new(),
         };
-        // Remove replaced sessions from the primary index after updating the user index 更新用户索引后移除被替换会话
+        // Remove displaced sessions from every index before adding the new session 新会话加入前从全部索引移除被替换会话
         let replaced = replaced_ids
             .into_iter()
             .filter_map(|id| {
@@ -69,10 +88,11 @@ impl Registry {
     }
 
     // Remove one exact session from both indexes 从两个索引中移除一个精确会话
-    pub(super) fn remove(&self, session: &Session) {
-        let session_id = session.id().clone();
-        self.remove_indexes(session);
-        self.by_session.remove(&session_id);
+    pub(super) fn remove(&self, session: &Session) -> Option<Session> {
+        let _mutation_guard = self.mutation_guard(session.connection_type(), session.user_id());
+        let (_, removed) = self.by_session.remove(session.id())?;
+        self.remove_indexes(&removed);
+        Some(removed)
     }
 
     // Snapshot all local sessions for one user 获取某个用户的全部本地会话快照
@@ -196,6 +216,17 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    // Lock the short index-mutation section for one user 锁定单个用户的短索引变更临界区
+    fn mutation_guard(
+        &self,
+        connection_type: &ConnectionType,
+        user_id: &UserId,
+    ) -> MutexGuard<'_, ()> {
+        self.mutation_locks[user_lock_index(connection_type, user_id)]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     // Add one session id to reverse indexes 将一个会话标识加入反向索引
     fn insert_indexes(
         &self,
@@ -233,7 +264,7 @@ impl Registry {
             self.by_user.remove(&user_key);
         }
 
-        // Remove the primary session record 删除主会话记录
+        // Remove the session id from the client reverse index 从客户端反向索引移除会话标识
         let should_prune_client = match self.by_client.entry(client_key.clone()) {
             Entry::Occupied(mut entry) => {
                 let ids = entry.get_mut();
@@ -246,6 +277,32 @@ impl Registry {
             self.by_client.remove(&client_key);
         }
     }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            by_session: DashMap::new(),
+            by_user: DashMap::new(),
+            by_client: DashMap::new(),
+            mutation_locks: (0..USER_LOCK_SHARDS)
+                .map(|_| Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            operation_locks: (0..USER_LOCK_SHARDS)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+}
+
+// Select one stable lock shard for a connection-user key 为连接体系用户键选择稳定锁分片
+fn user_lock_index(connection_type: &ConnectionType, user_id: &UserId) -> usize {
+    let mut hasher = DefaultHasher::new();
+    connection_type.hash(&mut hasher);
+    user_id.hash(&mut hasher);
+    hasher.finish() as usize % USER_LOCK_SHARDS
 }
 
 impl UserRouteKey {

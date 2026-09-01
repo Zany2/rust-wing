@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{ClientId, ConnectionType, NodeId, SessionId, UserId};
+use crate::lifecycle::DisconnectCause;
 use crate::protocol::{FrameKind, OutboundFrame};
 
 // Cluster routing entry 集群路由条目
@@ -16,6 +17,22 @@ pub struct Route {
     pub session_id: SessionId,
     // Owning node identifier 所属节点标识
     pub node_id: NodeId,
+}
+
+// Atomic route claim result 原子路由仲裁结果
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteClaim {
+    // Routes displaced by the new owner 被新所有者替换的路由
+    pub displaced: Vec<Route>,
+}
+
+// Exact route refresh result 精确路由续期结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteRefresh {
+    // The caller still owns the route and refreshed it 调用方仍拥有路由且已完成续期
+    Refreshed,
+    // The route expired, disappeared, or changed owner 路由已过期、消失或更换所有者
+    Lost,
 }
 
 // Cluster node lease registration result 集群节点租约注册结果
@@ -71,6 +88,9 @@ pub struct ClusterEnvelope {
     pub frame_kind: FrameKind,
     // Original frame payload 原始帧负载
     pub payload: Vec<u8>,
+    // Optional typed cause for a close frame 关闭帧携带的可选类型化原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnect_cause: Option<DisconnectCause>,
 }
 
 impl ClusterEnvelope {
@@ -83,6 +103,7 @@ impl ClusterEnvelope {
             },
             frame_kind: frame.kind,
             payload: frame.payload,
+            disconnect_cause: None,
         }
     }
 
@@ -101,6 +122,7 @@ impl ClusterEnvelope {
             },
             frame_kind: frame.kind,
             payload: frame.payload,
+            disconnect_cause: None,
         }
     }
 
@@ -110,6 +132,7 @@ impl ClusterEnvelope {
             target: ClusterTarget::Session { session_id },
             frame_kind: frame.kind,
             payload: frame.payload,
+            disconnect_cause: None,
         }
     }
 
@@ -119,6 +142,7 @@ impl ClusterEnvelope {
             target: ClusterTarget::Broadcast { connection_type },
             frame_kind: frame.kind,
             payload: frame.payload,
+            disconnect_cause: None,
         }
     }
 
@@ -128,7 +152,14 @@ impl ClusterEnvelope {
             target: ClusterTarget::BroadcastAll,
             frame_kind: frame.kind,
             payload: frame.payload,
+            disconnect_cause: None,
         }
+    }
+
+    // Attach a typed cause to a close-frame envelope 为关闭帧信封附加类型化原因
+    pub fn with_disconnect_cause(mut self, cause: DisconnectCause) -> Self {
+        self.disconnect_cause = Some(cause);
+        self
     }
 
     // Recover the original outbound frame 还原原始出站帧

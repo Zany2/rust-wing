@@ -15,6 +15,11 @@ pub mod publisher;
 // Redis adapters Redis 适配器
 #[cfg(feature = "redis")]
 pub mod redis;
+// Managed distributed runtime 托管的分布式运行时
+#[cfg(feature = "redis")]
+pub mod runtime;
+// Managed node subscriber contracts 托管节点订阅器契约
+pub mod subscriber;
 
 #[cfg(feature = "kafka")]
 pub use kafka::{
@@ -42,6 +47,14 @@ pub use redis::{
     RedisNodeSubscriberHandle, RedisPresenceAdapter, RedisPresenceConfig, RedisPublisherConfig,
     RedisRustWing, RedisSentinelConfig, redis_cluster_from_config, redis_cluster_parts_from_config,
     redis_rust_wing_from_config, redis_rust_wing_from_parts,
+};
+#[cfg(feature = "redis")]
+pub use runtime::{
+    DistributedRuntimeConfig, DistributedRuntimeHealth, DistributedRustWing, NodeTransportConfig,
+};
+pub use subscriber::{
+    ManagedNodeSubscriber, NodeSubscriberAdapter, NodeSubscriberStats, NodeSubscriberStatsSnapshot,
+    NodeSubscriberStatus,
 };
 
 // Build a RustWing cluster from adapter implementations 从适配器实现构建集群依赖

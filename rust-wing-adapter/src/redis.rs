@@ -4,18 +4,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use redis::AsyncCommands;
-use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection};
+use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection, PubSub};
 use redis::cluster::ClusterClient;
 use redis::cluster_async::ClusterConnection;
 use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
 use rust_wing_core::{
-    Cluster, ClusterEnvelope, ConnectionType, NodeId, NodeLease, Result, Route, RustWing,
-    RustWingConfig, RustWingError, SessionId, UserId,
+    Cluster, ClusterEnvelope, ConnectionPolicy, ConnectionType, NodeId, NodeLease, Result, Route,
+    RouteClaim, RouteRefresh, RustWing, RustWingConfig, RustWingError, SessionId, UserId,
 };
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::task::JoinHandle;
 
-use crate::{NodePublisherAdapter, PresenceStoreAdapter, cluster_from_adapters};
+use crate::{
+    ManagedNodeSubscriber, NodePublisherAdapter, NodeSubscriberAdapter, NodeSubscriberStats,
+    NodeSubscriberStatsSnapshot, NodeSubscriberStatus, PresenceStoreAdapter, cluster_from_adapters,
+};
 
 // Initial Redis subscriber reconnect delay in milliseconds Redis 订阅重连初始退避毫秒数
 const REDIS_SUBSCRIBER_RECONNECT_BASE_MS: u64 = 100;
@@ -25,6 +28,65 @@ const REDIS_SUBSCRIBER_RECONNECT_MAX_MS: u64 = 5_000;
 const REDIS_COMPARE_AND_EXPIRE_SCRIPT: &str = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end";
 // Delete a lease only while the expected instance still owns it 仅在预期实例仍持有时删除租约
 const REDIS_COMPARE_AND_DELETE_SCRIPT: &str = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
+// Atomically remove conflicting routes and establish the new route owner 原子移除冲突路由并建立新路由所有者
+const REDIS_CLAIM_ROUTE_SCRIPT: &str = r#"
+local displaced = {}
+local fields = redis.call('HGETALL', KEYS[1])
+for index = 1, #fields, 2 do
+    local field = fields[index]
+    local payload = fields[index + 1]
+    local route = cjson.decode(payload)
+    local old_session_key = ARGV[7] .. field
+    local live = redis.call('GET', old_session_key) == payload and redis.call('EXISTS', ARGV[9] .. route['node_id']) == 1
+    local replace = false
+    if field ~= ARGV[1] then
+        if ARGV[4] == 'unique_user' then
+            replace = true
+        elseif ARGV[4] == 'unique_client' then
+            local client_id = route['client_id']
+            if ARGV[5] == '1' then
+                replace = client_id ~= nil and client_id == ARGV[6]
+            else
+                replace = client_id == nil or client_id == cjson.null
+            end
+        end
+    end
+    if not live or replace then
+        if live and replace then
+            table.insert(displaced, payload)
+        end
+        redis.call('HDEL', KEYS[1], field)
+        redis.call('DEL', old_session_key)
+        redis.call('SREM', KEYS[3], field)
+    end
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('SADD', KEYS[4], ARGV[8])
+return displaced
+"#;
+// Refresh only while every exact route ownership record still matches 仅在全部精确路由所有权记录仍匹配时续期
+const REDIS_REFRESH_ROUTE_SCRIPT: &str = r#"
+local payload = redis.call('HGET', KEYS[1], ARGV[1])
+local session_payload = redis.call('GET', KEYS[2])
+if payload and session_payload == payload then
+    local route = cjson.decode(payload)
+    if redis.call('EXISTS', ARGV[3] .. route['node_id']) == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[2])
+        return 1
+    end
+end
+redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+redis.call('SREM', KEYS[3], ARGV[1])
+if redis.call('HLEN', KEYS[1]) == 0 then
+    redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
 
 // Redis deployment mode shared by presence and message adapters Redis 在线路由与消息适配器共用的部署模式
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +561,10 @@ pub struct RedisNodeSubscriberHandle {
     stop: watch::Sender<bool>,
     // Background subscriber task 后台订阅任务
     task: JoinHandle<Result<()>>,
+    // Latest subscriber lifecycle state 最新订阅器生命周期状态
+    status: watch::Receiver<NodeSubscriberStatus>,
+    // Shared subscriber counters 共享的订阅器计数器
+    stats: NodeSubscriberStats,
 }
 
 impl RedisPresenceAdapter {
@@ -665,7 +731,14 @@ pub async fn redis_rust_wing_from_parts(
     config.cluster.enabled = true;
     let parts = redis_cluster_parts_from_config(presence, publisher).await?;
     let wing = RustWing::with_cluster_checked(config, Some(parts.cluster)).await?;
-    let subscriber = parts.subscriber.spawn_current_node(wing.clone());
+    let subscriber = match parts.subscriber.start_current_node(wing.clone()).await {
+        Ok(subscriber) => subscriber,
+        Err(error) => {
+            // Release the node lease if the initial Redis subscription fails Redis 首次订阅失败时释放节点租约
+            let _ = wing.shutdown().await;
+            return Err(error);
+        }
+    };
     Ok(RedisRustWing { wing, subscriber })
 }
 
@@ -694,6 +767,56 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
             .query_async::<()>(&mut connection)
             .await
             .map_err(|error| redis_error("register redis presence route", error))
+    }
+
+    // Atomically claim one Redis route according to policy 按策略原子仲裁一条 Redis 路由
+    async fn claim(
+        &self,
+        route: Route,
+        policy: ConnectionPolicy,
+        ttl: Duration,
+    ) -> Result<RouteClaim> {
+        let mut connection = self.connection.clone();
+        let user_key = self.key_for_user(&route.connection_type, &route.user_id);
+        let session_key = self.key_for_session(&route.session_id);
+        let sessions_key = self.key_for_sessions();
+        let nodes_key = self.key_for_nodes();
+        let field = route.session_id.as_str().to_owned();
+        let payload = serde_json::to_vec(&route)?;
+        let (client_present, client_id) = route
+            .client_id
+            .as_ref()
+            .map(|client_id| ("1", client_id.as_str()))
+            .unwrap_or(("0", ""));
+        let policy = match policy {
+            ConnectionPolicy::UniqueUser => "unique_user",
+            ConnectionPolicy::UniqueClient => "unique_client",
+            ConnectionPolicy::MultiSession => "multi_session",
+        };
+        let displaced_payloads = redis::cmd("EVAL")
+            .arg(REDIS_CLAIM_ROUTE_SCRIPT)
+            .arg(4)
+            .arg(&user_key)
+            .arg(&session_key)
+            .arg(&sessions_key)
+            .arg(&nodes_key)
+            .arg(&field)
+            .arg(&payload)
+            .arg(ttl_seconds(ttl))
+            .arg(policy)
+            .arg(client_present)
+            .arg(client_id)
+            .arg(redis_presence_session_prefix(&self.config.key_prefix))
+            .arg(route.node_id.as_str())
+            .arg(redis_presence_node_lease_prefix(&self.config.key_prefix))
+            .query_async::<Vec<Vec<u8>>>(&mut connection)
+            .await
+            .map_err(|error| redis_error("claim redis presence route", error))?;
+        let displaced = displaced_payloads
+            .into_iter()
+            .map(|payload| serde_json::from_slice(&payload))
+            .collect::<std::result::Result<Vec<Route>, _>>()?;
+        Ok(RouteClaim { displaced })
     }
 
     // Remove one exact route from Redis 从 Redis 删除一条精确路由
@@ -725,18 +848,29 @@ impl PresenceStoreAdapter for RedisPresenceAdapter {
         user_id: &UserId,
         session_id: &SessionId,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<RouteRefresh> {
         // Clone the manager because Redis commands need a mutable connection 克隆连接管理器以满足命令的可变访问
         let mut connection = self.connection.clone();
-        let key = self.key_for_user(connection_type, user_id);
+        let user_key = self.key_for_user(connection_type, user_id);
         let session_key = self.key_for_session(session_id);
-        redis::pipe()
-            .atomic()
-            .expire(&key, ttl_seconds(ttl))
-            .expire(&session_key, ttl_seconds(ttl))
-            .query_async::<()>(&mut connection)
+        let sessions_key = self.key_for_sessions();
+        let refreshed = redis::cmd("EVAL")
+            .arg(REDIS_REFRESH_ROUTE_SCRIPT)
+            .arg(3)
+            .arg(&user_key)
+            .arg(&session_key)
+            .arg(&sessions_key)
+            .arg(session_id.as_str())
+            .arg(ttl_seconds(ttl))
+            .arg(redis_presence_node_lease_prefix(&self.config.key_prefix))
+            .query_async::<i64>(&mut connection)
             .await
-            .map_err(|error| redis_error("touch redis presence route", error))
+            .map_err(|error| redis_error("touch redis presence route", error))?;
+        Ok(if refreshed == 1 {
+            RouteRefresh::Refreshed
+        } else {
+            RouteRefresh::Lost
+        })
     }
 
     // Locate every current route for one user 查询用户当前全部路由
@@ -936,24 +1070,80 @@ impl RedisNodeSubscriberAdapter {
     // Consume messages for one node until the Pub/Sub stream ends 为指定节点持续消费消息直到订阅流结束
     pub async fn run_for_node(&self, node_id: NodeId, wing: RustWing) -> Result<()> {
         let (_stop_tx, stop_rx) = watch::channel(false);
-        self.run_for_node_until_stop(node_id, wing, stop_rx).await
+        let (status_tx, _status_rx) = watch::channel(NodeSubscriberStatus::Starting);
+        self.run_for_node_until_stop(
+            node_id,
+            wing,
+            stop_rx,
+            status_tx,
+            NodeSubscriberStats::default(),
+            None,
+        )
+        .await
     }
 
-    // Start a managed subscriber task for the manager's configured node 为管理器当前节点启动托管订阅任务
+    // Spawn a subscriber task without waiting for subscription readiness 不等待订阅就绪并启动当前节点订阅任务
     pub fn spawn_current_node(&self, wing: RustWing) -> RedisNodeSubscriberHandle {
         self.spawn_for_node(wing.config().node_id.clone(), wing)
     }
 
-    // Start a managed subscriber task for one node 为指定节点启动托管订阅任务
+    // Spawn one subscriber task without waiting for subscription readiness 不等待订阅就绪并启动指定节点订阅任务
     pub fn spawn_for_node(&self, node_id: NodeId, wing: RustWing) -> RedisNodeSubscriberHandle {
         let subscriber = self.clone();
         let (stop, stop_rx) = watch::channel(false);
+        let (status_tx, status) = watch::channel(NodeSubscriberStatus::Starting);
+        let stats = NodeSubscriberStats::default();
+        let task_stats = stats.clone();
         let task = tokio::spawn(async move {
             subscriber
-                .run_for_node_until_stop(node_id, wing, stop_rx)
+                .run_for_node_until_stop(node_id, wing, stop_rx, status_tx, task_stats, None)
                 .await
         });
-        RedisNodeSubscriberHandle { stop, task }
+        RedisNodeSubscriberHandle {
+            stop,
+            task,
+            status,
+            stats,
+        }
+    }
+
+    // Start a ready subscriber for the manager's configured node 为管理器当前节点启动已就绪的订阅器
+    pub async fn start_current_node(&self, wing: RustWing) -> Result<RedisNodeSubscriberHandle> {
+        self.start_for_node(wing.config().node_id.clone(), wing)
+            .await
+    }
+
+    // Start a node subscriber after Redis confirms the subscription 在 Redis 确认订阅后启动指定节点订阅器
+    pub async fn start_for_node(
+        &self,
+        node_id: NodeId,
+        wing: RustWing,
+    ) -> Result<RedisNodeSubscriberHandle> {
+        let channel = self.channel_for_node(&node_id);
+        let pubsub = self.subscribe_node_channel(&channel, 1).await?;
+        let subscriber = self.clone();
+        let (stop, stop_rx) = watch::channel(false);
+        let (status_tx, status) = watch::channel(NodeSubscriberStatus::Running);
+        let stats = NodeSubscriberStats::default();
+        let task_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            subscriber
+                .run_for_node_until_stop(
+                    node_id,
+                    wing,
+                    stop_rx,
+                    status_tx,
+                    task_stats,
+                    Some(pubsub),
+                )
+                .await
+        });
+        Ok(RedisNodeSubscriberHandle {
+            stop,
+            task,
+            status,
+            stats,
+        })
     }
 
     // Consume messages until Redis ends the stream or a stop signal arrives 消费消息直到 Redis 结束流或收到停止信号
@@ -962,45 +1152,60 @@ impl RedisNodeSubscriberAdapter {
         node_id: NodeId,
         wing: RustWing,
         mut stop_rx: watch::Receiver<bool>,
+        status: watch::Sender<NodeSubscriberStatus>,
+        stats: NodeSubscriberStats,
+        mut initial_pubsub: Option<PubSub>,
     ) -> Result<()> {
         let channel = self.channel_for_node(&node_id);
         let mut reconnect_attempt = 0_u32;
         loop {
-            if *stop_rx.borrow() {
+            if subscriber_stop_requested(&stop_rx) {
+                let _ = status.send(NodeSubscriberStatus::Stopped);
                 break;
             }
-            let result = self
-                .consume_node_channel_once(
-                    &channel,
-                    &wing,
-                    &mut stop_rx,
-                    reconnect_attempt.saturating_add(1),
-                )
-                .await;
-            if *stop_rx.borrow() {
+
+            let pubsub = match initial_pubsub.take() {
+                Some(pubsub) => Ok(pubsub),
+                None => {
+                    self.subscribe_node_channel(&channel, reconnect_attempt.saturating_add(1))
+                        .await
+                }
+            };
+            let result = match pubsub {
+                Ok(pubsub) => {
+                    let _ = status.send(NodeSubscriberStatus::Running);
+                    Self::consume_node_channel(pubsub, &wing, &mut stop_rx, &stats).await
+                }
+                Err(error) => Err(error),
+            };
+
+            if subscriber_stop_requested(&stop_rx) {
+                let _ = status.send(NodeSubscriberStatus::Stopped);
                 break;
             }
+            stats.record_reconnect();
+            let _ = status.send(NodeSubscriberStatus::Reconnecting);
             if result.is_err() {
+                stats.record_consume_failed();
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
             } else {
                 reconnect_attempt = 1;
             }
             let delay = redis_subscriber_reconnect_delay(reconnect_attempt);
             if wait_for_subscriber_reconnect_delay(delay, &mut stop_rx).await {
+                let _ = status.send(NodeSubscriberStatus::Stopped);
                 break;
             }
         }
         Ok(())
     }
 
-    // Consume one Redis Pub/Sub connection until it disconnects 消费单条 Redis Pub/Sub 连接直到断开
-    async fn consume_node_channel_once(
+    // Connect and subscribe to one Redis node channel 连接并订阅一个 Redis 节点频道
+    async fn subscribe_node_channel(
         &self,
         channel: &str,
-        wing: &RustWing,
-        stop_rx: &mut watch::Receiver<bool>,
         reconnect_attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<PubSub> {
         let client = self.source.client_for_attempt(reconnect_attempt).await?;
         let mut pubsub = client
             .get_async_pubsub()
@@ -1011,28 +1216,43 @@ impl RedisNodeSubscriberAdapter {
             .subscribe(&channel)
             .await
             .map_err(|error| redis_error("subscribe redis node channel", error))?;
+        Ok(pubsub)
+    }
 
+    // Consume one established Redis Pub/Sub connection 消费一个已经建立的 Redis Pub/Sub 连接
+    async fn consume_node_channel(
+        mut pubsub: PubSub,
+        wing: &RustWing,
+        stop_rx: &mut watch::Receiver<bool>,
+        stats: &NodeSubscriberStats,
+    ) -> Result<()> {
         let mut messages = pubsub.on_message();
         loop {
             tokio::select! {
                 message = messages.next() => {
                     let Some(message) = message else {
-                        break;
+                        return Err(RustWingError::Cluster("redis node subscription ended".into()));
                     };
-                    let Ok(envelope) = serde_json::from_slice::<ClusterEnvelope>(message.get_payload_bytes()) else {
-                        continue;
+                    stats.record_received();
+                    let envelope = match serde_json::from_slice::<ClusterEnvelope>(message.get_payload_bytes()) {
+                        Ok(envelope) => envelope,
+                        Err(_) => {
+                            stats.record_decode_failed();
+                            continue;
+                        }
                     };
                     // Deliver the cross-node envelope into local sessions 将跨节点信封投递到本地会话
-                    let _ = wing.handle_cluster_envelope(envelope);
+                    if wing.handle_cluster_envelope_async(envelope).await.is_err() {
+                        stats.record_delivery_failed();
+                    }
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
-                        break;
+                        return Ok(());
                     }
                 }
             }
         }
-        Ok(())
     }
 
     // Build the Redis channel for one node 构建单个节点的 Redis 频道
@@ -1042,6 +1262,16 @@ impl RedisNodeSubscriberAdapter {
 }
 
 impl RedisNodeSubscriberHandle {
+    // Return the latest subscriber lifecycle state 返回最新的订阅器生命周期状态
+    pub fn status(&self) -> NodeSubscriberStatus {
+        self.status.borrow().clone()
+    }
+
+    // Return a point-in-time subscriber counter snapshot 返回订阅器计数器的时间点快照
+    pub fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     // Ask the subscriber task to stop and wait for it 请求订阅任务停止并等待结束
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(true);
@@ -1058,6 +1288,34 @@ impl RedisNodeSubscriberHandle {
     }
 }
 
+#[async_trait]
+impl NodeSubscriberAdapter for RedisNodeSubscriberAdapter {
+    async fn start_for_node(
+        &self,
+        node_id: NodeId,
+        wing: RustWing,
+    ) -> Result<Box<dyn ManagedNodeSubscriber>> {
+        RedisNodeSubscriberAdapter::start_for_node(self, node_id, wing)
+            .await
+            .map(|subscriber| Box::new(subscriber) as Box<dyn ManagedNodeSubscriber>)
+    }
+}
+
+#[async_trait]
+impl ManagedNodeSubscriber for RedisNodeSubscriberHandle {
+    fn status(&self) -> NodeSubscriberStatus {
+        RedisNodeSubscriberHandle::status(self)
+    }
+
+    fn stats(&self) -> NodeSubscriberStatsSnapshot {
+        RedisNodeSubscriberHandle::stats(self)
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<()> {
+        RedisNodeSubscriberHandle::shutdown(*self).await
+    }
+}
+
 // Convert Redis errors into the core error type 将 Redis 错误转换为核心错误类型
 impl RedisRustWing {
     // Borrow the managed core manager 借用托管的核心管理器
@@ -1070,18 +1328,30 @@ impl RedisRustWing {
         self.wing.clone()
     }
 
+    // Return the latest Redis subscriber lifecycle state 返回最新的 Redis 订阅器生命周期状态
+    pub fn subscriber_status(&self) -> NodeSubscriberStatus {
+        self.subscriber.status()
+    }
+
+    // Check whether the Redis subscriber is ready 检查 Redis 订阅器是否已就绪
+    pub fn is_ready(&self) -> bool {
+        self.wing.is_ready() && self.subscriber_status().is_ready()
+    }
+
+    // Return a point-in-time Redis subscriber counter snapshot 返回 Redis 订阅器计数器的时间点快照
+    pub fn subscriber_stats(&self) -> NodeSubscriberStatsSnapshot {
+        self.subscriber.stats()
+    }
+
     // Split the runtime into its core manager and subscriber handle 拆分运行时为核心管理器和订阅句柄
     pub fn into_parts(self) -> (RustWing, RedisNodeSubscriberHandle) {
         (self.wing, self.subscriber)
     }
 
-    // Stop Redis subscription and unregister local runtime state 停止 Redis 订阅并注销本地运行状态
+    // Drain local runtime state before stopping the Redis subscription 清理本地运行状态后再停止 Redis 订阅
     pub async fn shutdown(self) -> Result<usize> {
         let (wing, subscriber) = self.into_parts();
-        let subscriber_result = subscriber.shutdown().await;
-        let shutdown_result = wing.shutdown().await;
-        subscriber_result?;
-        shutdown_result
+        crate::runtime::shutdown_managed_runtime(wing, Box::new(subscriber)).await
     }
 }
 
@@ -1158,6 +1428,11 @@ async fn wait_for_subscriber_reconnect_delay(
     }
 }
 
+// Check whether the subscriber was stopped or its controller was dropped 检查订阅器是否被停止或其控制端已释放
+fn subscriber_stop_requested(stop_rx: &watch::Receiver<bool>) -> bool {
+    *stop_rx.borrow() || stop_rx.has_changed().is_err()
+}
+
 // Convert a Duration to Redis EXPIRE seconds 将 Duration 转换为 Redis EXPIRE 秒数
 fn ttl_seconds(ttl: Duration) -> i64 {
     // Round up sub-second TTLs so a positive TTL never expires immediately 向上取整避免正 TTL 立即过期
@@ -1182,10 +1457,15 @@ fn redis_presence_user_key(
 // Build the Redis key for one session route 构建单个会话路由的 Redis key
 fn redis_presence_session_key(key_prefix: &str, session_id: &SessionId) -> String {
     format!(
-        "{}:session:{}",
-        redis_presence_namespace(key_prefix),
+        "{}{}",
+        redis_presence_session_prefix(key_prefix),
         session_id.as_str()
     )
+}
+
+// Build the Redis key prefix shared by individual session routes 构建单会话路由共用的 Redis key 前缀
+fn redis_presence_session_prefix(key_prefix: &str) -> String {
+    format!("{}:session:", redis_presence_namespace(key_prefix))
 }
 
 // Build the Redis set key for all known sessions 构建全部已知会话的 Redis 集合 key
@@ -1201,10 +1481,15 @@ fn redis_presence_nodes_key(key_prefix: &str) -> String {
 // Build the Redis key for one node lease 构建单个节点租约的 Redis key
 fn redis_presence_node_lease_key(key_prefix: &str, node_id: &NodeId) -> String {
     format!(
-        "{}:node:{}",
-        redis_presence_namespace(key_prefix),
+        "{}{}",
+        redis_presence_node_lease_prefix(key_prefix),
         node_id.as_str()
     )
+}
+
+// Build the Redis key prefix shared by node leases 构建节点租约共用的 Redis key 前缀
+fn redis_presence_node_lease_prefix(key_prefix: &str) -> String {
+    format!("{}:node:", redis_presence_namespace(key_prefix))
 }
 
 // Build the versioned same-slot namespace for all presence keys 构建全部在线路由 key 共用的版本化同槽命名空间
@@ -1317,8 +1602,20 @@ mod tests {
         let sessions = redis_presence_sessions_key("rust-wing");
         let nodes = redis_presence_nodes_key("rust-wing");
         let lease = redis_presence_node_lease_key("rust-wing", &NodeId::from("node-a"));
+        let session_prefix = redis_presence_session_prefix("rust-wing");
+        let lease_prefix = redis_presence_node_lease_prefix("rust-wing");
 
-        for key in [user, session, sessions, nodes, lease] {
+        assert_eq!(session, format!("{session_prefix}session-a"));
+        assert_eq!(lease, format!("{lease_prefix}node-a"));
+        for key in [
+            user,
+            session,
+            sessions,
+            nodes,
+            lease,
+            session_prefix,
+            lease_prefix,
+        ] {
             assert!(key.starts_with("{rust-wing:presence}:v2:"));
         }
     }
